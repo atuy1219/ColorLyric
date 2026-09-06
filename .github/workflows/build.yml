@@ -17,8 +17,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.5.0'
-      - name: Build debug APK
-        run: gradle :app:assembleDebug
+      - name: Test, lint and build debug APK
+        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: ColorLyric-debug
