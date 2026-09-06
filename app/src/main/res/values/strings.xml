@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ColorLyric</string>
+    <string name="module_description">Unlock the stock ColorOS/OxygenOS lock-screen lyric page for Spotify</string>
+</resources>
