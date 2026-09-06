@@ -7,20 +7,13 @@ import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import io.github.libxposed.api.XposedInterface;
+import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.XposedModuleInterface;
 
-/**
- * Minimal OPlus SystemUI compatibility hook.
- *
- * <p>This class does not touch lyric parsing, rendering, LyricsRecyclerView, MediaData or
- * notifications. It only makes OPlus lyric package-policy lookups evaluate Spotify with the same
- * package policy as QQ Music, which is a stock-supported player on the target ROM.</p>
- */
-public final class SystemUiPolicyHookEntry implements IXposedHookLoadPackage {
+public final class SystemUiPolicyHookEntry extends XposedModule {
     private static final String TAG = "ColorLyric";
     private static final String SYSTEMUI = "com.android.systemui";
     private static final String SPOTIFY = "com.spotify.music";
@@ -29,91 +22,122 @@ public final class SystemUiPolicyHookEntry implements IXposedHookLoadPackage {
     private static final String LEGACY_SELECTOR =
             "com.oplus.systemui.media.controls.pipeline.MediaActionPrioritySelectorImpl";
 
-    private static final Set<String> HOOKED_METHODS =
+    private final Set<String> hookedMethods = ConcurrentHashMap.newKeySet();
+    private final Set<String> aliasLogged = ConcurrentHashMap.newKeySet();
+    private final Set<XposedInterface.HookHandle> loadClassHandles =
             Collections.synchronizedSet(new HashSet<>());
-    private static final Set<XC_MethodHook.Unhook> LOAD_CLASS_UNHOOKS =
-            Collections.synchronizedSet(new HashSet<>());
+    private final ThreadLocal<Boolean> discoveryGuard = new ThreadLocal<>();
 
-    private static volatile boolean entranceHooked;
-    private static volatile boolean enableHooked;
-    private static volatile boolean watcherInstalled;
+    private volatile boolean entranceHooked;
+    private volatile boolean enableHooked;
+    private volatile boolean watcherInstalled;
+    private volatile boolean initialized;
 
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!SYSTEMUI.equals(lpparam.packageName) || !SYSTEMUI.equals(lpparam.processName)) return;
-
-        log("SystemUI minimal lyric-policy hook loading");
-
-        boolean direct = tryHookKnownSelector(lpparam.classLoader);
-        if (!direct || !entranceHooked) {
-            installClassLoadWatcher();
+    public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
+        if (!SYSTEMUI.equals(param.getProcessName())) {
+            detach();
+            return;
         }
-
-        log("SystemUI policy hook ready entrance=" + entranceHooked
-                + " enable=" + enableHooked
-                + " watcher=" + watcherInstalled);
+        info("SystemUI minimal lyric-policy hook loading; API=" + getApiVersion());
     }
 
-    private static boolean tryHookKnownSelector(ClassLoader classLoader) {
+    @Override
+    public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
+        if (!SYSTEMUI.equals(param.getPackageName()) || initialized) return;
+        synchronized (this) {
+            if (initialized) return;
+            initialized = true;
+
+            boolean direct = tryHookKnownSelector(param.getClassLoader());
+            if (!direct || !entranceHooked) {
+                installClassLoadWatcher();
+            }
+
+            info("SystemUI policy hook ready entrance=" + entranceHooked
+                    + " enable=" + enableHooked
+                    + " watcher=" + watcherInstalled);
+        }
+    }
+
+    private boolean tryHookKnownSelector(ClassLoader classLoader) {
         try {
             Class<?> selector = Class.forName(LEGACY_SELECTOR, false, classLoader);
             hookPolicyMethods(selector);
             return entranceHooked || enableHooked;
         } catch (Throwable error) {
-            log("known selector unavailable; enabling discovery watcher: "
+            info("known selector unavailable; enabling discovery watcher: "
                     + error.getClass().getSimpleName());
             return false;
         }
     }
 
-    private static void installClassLoadWatcher() {
-        if (watcherInstalled) return;
-        synchronized (SystemUiPolicyHookEntry.class) {
-            if (watcherInstalled) return;
+    private void installClassLoadWatcher() {
+        if (watcherInstalled || entranceHooked) return;
+        synchronized (this) {
+            if (watcherInstalled || entranceHooked) return;
             watcherInstalled = true;
 
-            XC_MethodHook callback = new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    Object result = param.getResult();
-                    if (!(result instanceof Class<?>)) return;
-                    Class<?> type = (Class<?>) result;
-                    String name = type.getName();
-                    if (name == null || !name.startsWith(OPLUS_MEDIA_PREFIX)) return;
-
-                    hookPolicyMethods(type);
-                    if (entranceHooked && enableHooked) {
-                        removeClassLoadWatcher();
-                    }
+            for (Method method : ClassLoader.class.getDeclaredMethods()) {
+                if (!"loadClass".equals(method.getName())) continue;
+                if (method.getParameterCount() < 1 || method.getParameterTypes()[0] != String.class) {
+                    continue;
                 }
-            };
+                try {
+                    method.setAccessible(true);
+                    XposedInterface.HookHandle handle = hook(method)
+                            .setId("colorlyric-systemui-policy-discovery")
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .intercept(chain -> {
+                                Object result = chain.proceed();
+                                if (!(result instanceof Class<?>)) return result;
+                                if (Boolean.TRUE.equals(discoveryGuard.get())) return result;
 
-            try {
-                LOAD_CLASS_UNHOOKS.addAll(XposedBridge.hookAllMethods(
-                        ClassLoader.class, "loadClass", callback));
-                log("OPlus media class discovery watcher installed");
-            } catch (Throwable error) {
-                log("class discovery watcher failed: "
-                        + error.getClass().getSimpleName() + ": " + error.getMessage());
+                                Class<?> type = (Class<?>) result;
+                                String name = type.getName();
+                                if (name == null || !name.startsWith(OPLUS_MEDIA_PREFIX)) return result;
+
+                                discoveryGuard.set(Boolean.TRUE);
+                                try {
+                                    hookPolicyMethods(type);
+                                    if (entranceHooked) removeClassLoadWatcher();
+                                } finally {
+                                    discoveryGuard.remove();
+                                }
+                                return result;
+                            });
+                    loadClassHandles.add(handle);
+                } catch (Throwable error) {
+                    info("class discovery watcher method failed: "
+                            + error.getClass().getSimpleName());
+                }
+            }
+
+            if (loadClassHandles.isEmpty()) {
+                watcherInstalled = false;
+                info("OPlus media class discovery watcher unavailable");
+            } else {
+                info("OPlus media class discovery watcher installed");
             }
         }
     }
 
-    private static void removeClassLoadWatcher() {
-        synchronized (SystemUiPolicyHookEntry.class) {
-            if (LOAD_CLASS_UNHOOKS.isEmpty()) return;
-            for (XC_MethodHook.Unhook unhook : new HashSet<>(LOAD_CLASS_UNHOOKS)) {
+    private void removeClassLoadWatcher() {
+        synchronized (this) {
+            if (loadClassHandles.isEmpty()) return;
+            for (XposedInterface.HookHandle handle : new HashSet<>(loadClassHandles)) {
                 try {
-                    unhook.unhook();
+                    handle.unhook();
                 } catch (Throwable ignored) {
                 }
             }
-            LOAD_CLASS_UNHOOKS.clear();
-            log("OPlus media class discovery watcher removed");
+            loadClassHandles.clear();
+            watcherInstalled = false;
+            info("OPlus media class discovery watcher removed");
         }
     }
 
-    private static void hookPolicyMethods(Class<?> type) {
+    private void hookPolicyMethods(Class<?> type) {
         if (type == null) return;
         Method[] methods;
         try {
@@ -129,33 +153,40 @@ public final class SystemUiPolicyHookEntry implements IXposedHookLoadPackage {
                     || method.getParameterTypes()[0] != String.class) continue;
 
             String key = type.getName() + "#" + name;
-            if (!HOOKED_METHODS.add(key)) continue;
+            if (!hookedMethods.add(key)) continue;
 
             try {
                 method.setAccessible(true);
-                XposedBridge.hookMethod(method, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        if (param.args == null || param.args.length == 0) return;
-                        if (!SPOTIFY.equals(param.args[0])) return;
-                        param.args[0] = QQ_MUSIC;
-                        log("policy alias " + name + ": Spotify -> QQ Music");
-                    }
-                });
+                hook(method)
+                        .setId("colorlyric-systemui-" + name)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            Object arg = chain.getArg(0);
+                            if (!SPOTIFY.equals(arg)) return chain.proceed();
+
+                            Object[] args = chain.getArgs().toArray();
+                            args[0] = QQ_MUSIC;
+                            if (aliasLogged.add(name)) {
+                                info("policy alias " + name + ": Spotify -> QQ Music");
+                            }
+                            return chain.proceed(args);
+                        });
 
                 if ("getLyricEntrance".equals(name)) entranceHooked = true;
                 if ("getLyricEnable".equals(name)) enableHooked = true;
-                log("hooked " + key);
+                info("hooked " + key);
             } catch (Throwable error) {
-                HOOKED_METHODS.remove(key);
-                log("failed to hook " + key + ": "
+                hookedMethods.remove(key);
+                info("failed to hook " + key + ": "
                         + error.getClass().getSimpleName() + ": " + error.getMessage());
             }
         }
+
+        if (entranceHooked) removeClassLoadWatcher();
     }
 
-    private static void log(String message) {
+    private void info(String message) {
         Log.i(TAG, message);
-        XposedBridge.log(TAG + ": " + message);
+        log(Log.INFO, TAG, message);
     }
 }
