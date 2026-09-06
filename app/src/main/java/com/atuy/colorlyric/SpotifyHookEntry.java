@@ -45,6 +45,8 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
 
     private static volatile String currentTrackKey = "";
     private static volatile StockLyricInfo.TrackSnapshot currentTrack = StockLyricInfo.TrackSnapshot.empty();
+    private static volatile String committedTrackKey = "";
+    private static volatile long committedGeneration = -1L;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -79,7 +81,7 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
                         || !(param.args[0] instanceof PlaybackState)) return;
                 MediaSession session = (MediaSession) param.thisObject;
                 REGISTRY.onPlaybackState(session, ((PlaybackState) param.args[0]).getState());
-                replayCachedIfReady(session, "playback");
+                publishCachedOnceIfReady(session, "playback-ready");
             }
         });
 
@@ -90,7 +92,7 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
                         || !(param.args[0] instanceof Boolean)) return;
                 MediaSession session = (MediaSession) param.thisObject;
                 REGISTRY.onActive(session, (Boolean) param.args[0]);
-                replayCachedIfReady(session, "active");
+                publishCachedOnceIfReady(session, "active-ready");
             }
         });
 
@@ -119,6 +121,7 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
             String accepted = StockLyricInfo.normalize(existing, track);
             if (accepted != null && track.hasSpotifyTrackId()) {
                 CACHE.put(track.key(), accepted);
+                markCommitted(track.key(), observation.generation);
                 log("existing native lyricInfo observed: " + shortId(track.mediaId));
             }
             return;
@@ -133,7 +136,8 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
             if (parcelBytes > 0 && parcelBytes <= StockLyricInfo.MAX_PARCEL_BYTES) {
                 param.args[0] = patched;
                 REGISTRY.onHostMetadata(session, patched);
-                log("cached lyricInfo injected into host metadata: " + shortId(track.mediaId)
+                markCommitted(track.key(), observation.generation);
+                log("cached lyricInfo attached to host metadata: " + shortId(track.mediaId)
                         + " parcel=" + parcelBytes);
             }
             return;
@@ -153,6 +157,8 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
             if (incomingHasId && !incoming.mediaId.equals(currentTrackKey)) {
                 currentTrackKey = incoming.mediaId;
                 currentTrack = incoming;
+                committedTrackKey = "";
+                committedGeneration = -1L;
                 long generation = GENERATION.incrementAndGet();
                 log("track=" + shortId(incoming.mediaId) + " generation=" + generation
                         + " " + incoming.debugSummary());
@@ -195,17 +201,22 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
             } finally {
                 IN_FLIGHT.remove(trackKey);
             }
-        }, 500, TimeUnit.MILLISECONDS);
+        }, 100, TimeUnit.MILLISECONDS);
     }
 
-    private static void replayCachedIfReady(MediaSession session, String reason) {
+    private static void publishCachedOnceIfReady(MediaSession session, String reason) {
         if (Boolean.TRUE.equals(MODULE_WRITE.get())) return;
         SpotifySessionRegistry.Selection selection = REGISTRY.selectionFor(session);
         if (selection == null || !selection.track.hasSpotifyTrackId()) return;
         if (!selection.active || !SpotifySessionRegistry.isPlaybackStateValid(selection.playbackState)) return;
-        String payload = CACHE.get(selection.track.key());
+
+        String trackKey = selection.track.key();
+        long generation = GENERATION.get();
+        if (!isCurrent(trackKey, generation) || isCommitted(trackKey, generation)) return;
+
+        String payload = CACHE.get(trackKey);
         if (payload == null) return;
-        publishToSelection(selection.track.key(), GENERATION.get(), payload, selection, reason);
+        publishToSelection(trackKey, generation, payload, selection, reason);
     }
 
     private static StockLyricInfo.TrackSnapshot snapshotCurrent(String trackKey, long generation) {
@@ -216,7 +227,7 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
     }
 
     private static void publish(String trackKey, long generation, String payload, String reason) {
-        if (!isCurrent(trackKey, generation)) return;
+        if (!isCurrent(trackKey, generation) || isCommitted(trackKey, generation)) return;
         SpotifySessionRegistry.Selection selection = REGISTRY.select(trackKey);
         if (selection == null) {
             log("publish pending; no unique main session: " + REGISTRY.describe());
@@ -227,7 +238,7 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
 
     private static void publishToSelection(String trackKey, long generation, String payload,
                                            SpotifySessionRegistry.Selection selection, String reason) {
-        if (!isCurrent(trackKey, generation)) return;
+        if (!isCurrent(trackKey, generation) || isCommitted(trackKey, generation)) return;
         if (selection == null || selection.session == null || selection.metadata == null) return;
         if (SpotifySessionRegistry.isCastTag(selection.tag)) return;
         if (selection.track.hasSpotifyTrackId() && !trackKey.equals(selection.track.key())) return;
@@ -247,7 +258,8 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
             MODULE_WRITE.set(Boolean.TRUE);
             selection.session.setMetadata(patched);
             REGISTRY.onHostMetadata(selection.session, patched);
-            log("native lyricInfo committed: " + shortId(trackKey)
+            markCommitted(trackKey, generation);
+            log("native lyricInfo committed once: " + shortId(trackKey)
                     + " reason=" + reason
                     + " tag=" + selection.tag
                     + " active=" + selection.active
@@ -262,6 +274,15 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
 
     private static boolean isCurrent(String trackKey, long generation) {
         return generation == GENERATION.get() && trackKey.equals(currentTrackKey);
+    }
+
+    private static boolean isCommitted(String trackKey, long generation) {
+        return generation == committedGeneration && trackKey.equals(committedTrackKey);
+    }
+
+    private static void markCommitted(String trackKey, long generation) {
+        committedTrackKey = trackKey;
+        committedGeneration = generation;
     }
 
     private static String safeLyricInfo(MediaMetadata metadata) {
