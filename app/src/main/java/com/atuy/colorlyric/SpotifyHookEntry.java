@@ -4,8 +4,6 @@ package com.atuy.colorlyric;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 
 import java.util.Collections;
@@ -31,7 +29,6 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
     private static final AtomicLong GENERATION = new AtomicLong();
     private static final Set<String> IN_FLIGHT = ConcurrentHashMap.newKeySet();
     private static final SpotifySessionRegistry REGISTRY = new SpotifySessionRegistry();
-    private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final ScheduledExecutorService EXECUTOR = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread thread = new Thread(r, "ColorLyric-Lyrics");
         thread.setDaemon(true);
@@ -192,7 +189,7 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
                 String payload = StockLyricInfo.build(track, result.syncedLyrics, generation);
                 if (payload == null || !isCurrent(trackKey, generation)) return;
                 CACHE.put(trackKey, payload);
-                MAIN.post(() -> publish(trackKey, generation, payload, "fetch"));
+                publish(trackKey, generation, payload, "fetch");
             } catch (Throwable error) {
                 log("LRCLIB fetch failed: " + error.getClass().getSimpleName() + ": " + error.getMessage());
             } finally {
