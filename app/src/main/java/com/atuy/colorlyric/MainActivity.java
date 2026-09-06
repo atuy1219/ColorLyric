@@ -13,16 +13,13 @@ public final class MainActivity extends Activity {
         view.setPadding(padding, padding, padding, padding);
         view.setTextSize(16);
         view.setText(
-                "ColorLyric 1.0.0\n\n" +
-                "Spotify-only Xposed module\n" +
-                "Scope: com.spotify.music\n" +
-                "SystemUI is not hooked.\n\n" +
-                "Spotify内部の認証ヘッダーを取得し、Spotify公式Color Lyricsから" +
-                "同期歌詞を取得してMediaSessionへColorOS互換lyricInfoを発行します。\n" +
-                "LINE_SYNCED / SYLLABLE_SYNCEDに対応します。\n\n" +
-                "ロック画面互換のため、lyricInfoに加えてandroid.media.metadata.LYRICと" +
-                "OPlus向けratingUriも同じMediaSessionへ追加します。\n\n" +
-                "LSPosedでSpotifyだけを作用域にして、Spotifyを強制停止後に起動してください。\n\n" +
+                "ColorLyric 1.1.0\n\n" +
+                "Scope: com.spotify.music + com.android.systemui\n\n" +
+                "Spotify側では公式Color Lyricsを取得してMediaSessionへColorOS互換lyricInfoを発行します。\n" +
+                "SystemUI側では歌詞描画やLyricsRecyclerViewには触れず、" +
+                "SpotifyのgetLyricEntrance / getLyricEnableだけをQQ Musicと同じポリシーで評価します。\n\n" +
+                "LSPosedではSpotifyとシステムUIの2つを作用域にしてください。\n" +
+                "適用後は端末再起動を推奨します。\n\n" +
                 "Debug: adb logcat -s ColorLyric"
         );
         setContentView(view);
