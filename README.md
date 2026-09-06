@@ -1,6 +1,6 @@
 # ColorLyric
 
-ColorLyric is an Xposed module for Spotify lyrics on ColorOS/OxygenOS.
+ColorLyric is a libxposed API 102 module for Spotify lyrics on ColorOS/OxygenOS.
 
 ## Scope
 
@@ -30,6 +30,16 @@ stock Live Alert / lock-screen lyric UI
 
 LRCLIB is not used.
 
+## libxposed API
+
+ColorLyric targets libxposed API 102 and uses only the modern interceptor-chain API.
+Legacy `de.robv.android.xposed.*` APIs and legacy manifest/xposed_init metadata are not used.
+Module registration is stored under `META-INF/xposed/`:
+
+- `java_init.list`
+- `scope.list`
+- `module.prop`
+
 ## Lock-screen policy
 
 On the tested OPlus ROM, Spotify lyrics already reach the stock `LyricsRecyclerView`, but OPlus
@@ -45,11 +55,13 @@ policy value such as `52` is hard-coded; the ROM's current QQ Music value is reu
 
 The implementation first tries the known OPlus media action selector class. If the class name differs,
 it temporarily watches OPlus media class loading and hooks a class exposing the exact policy method
-shape. The watcher is removed after both policy methods are found.
+shape. The watcher is removed as soon as `getLyricEntrance` is secured; `getLyricEnable`, when it
+exists on that selector, is discovered in the same method scan. Alias logging is emitted only once per
+policy method.
 
 ## Spotify lyric source
 
-ColorLyric captures the headers needed by Spotify's Color Lyrics request path:
+ColorLyric captures only the headers needed by Spotify's Color Lyrics request path:
 
 - `authorization`
 - `client-token`
@@ -65,6 +77,30 @@ Supported timing:
 
 - `LINE_SYNCED`
 - `SYLLABLE_SYNCED`
+
+For Spotify update tolerance, ColorLyric tries the currently known header classes first and falls back
+to a temporary structural class-load discovery path. The fallback identifies the shaded immutable
+header container by class structure rather than its R8 `p.*` name, then removes the watcher.
+
+## Fetch lifecycle
+
+Each request is keyed by both track ID and track generation. Rapid `A → B → A` changes therefore do
+not allow an old request for A to suppress the new generation. When the track changes, active stale
+HTTP calls are cancelled and their `HttpURLConnection` is disconnected. Two fetch workers are used so
+a stalled request cannot create the previous single-thread head-of-line blocking behavior.
+
+Short negative caches prevent repeated requests for known misses:
+
+- HTTP 404: 6 hours
+- HTTP 403: 5 minutes
+- HTTP 429: 1 minute
+- no lyric lines: 30 minutes
+
+HTTP connections are always disconnected in `finally`.
+
+Cached lyric payloads are rebound to the current session generation before replay. Existing
+`lyricInfo` with a different `spotify:track:` `songId` is rejected instead of being cached against the
+current track.
 
 ## Installation
 
@@ -83,7 +119,7 @@ adb logcat -s ColorLyric
 Expected SystemUI lines include:
 
 ```text
-SystemUI minimal lyric-policy hook loading
+SystemUI minimal lyric-policy hook loading; API=102
 hooked ...#getLyricEntrance
 hooked ...#getLyricEnable
 policy alias getLyricEntrance: Spotify -> QQ Music
@@ -93,10 +129,22 @@ policy alias getLyricEnable: Spotify -> QQ Music
 Expected Spotify lines include:
 
 ```text
+loaded in Spotify main process; API=102
 Spotify auth headers ready keys=authorization,client-token,user-agent,x-client-id
 Spotify Color Lyrics outcome=ok syncType=LINE_SYNCED ...
 official Spotify lyricInfo committed once: ........
 ```
+
+## CI
+
+GitHub Actions runs unit tests, Android lint and a debug APK build:
+
+```sh
+gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+```
+
+Tests cover fetch generation/negative-cache policy, Spotify Color Lyrics decoding, header readiness,
+track metadata merging and `lyricInfo` track identity validation.
 
 ## Research notes
 
