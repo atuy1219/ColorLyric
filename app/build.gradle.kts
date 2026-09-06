@@ -10,8 +10,8 @@ android {
         applicationId = "com.atuy.colorlyric"
         minSdk = 31
         targetSdk = 36
-        versionCode = 10
-        versionName = "1.0.0-spotify-color-lyrics"
+        versionCode = 11
+        versionName = "1.1.0-lockscreen-policy"
     }
 
     buildTypes {
