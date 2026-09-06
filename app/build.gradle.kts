@@ -10,8 +10,8 @@ android {
         applicationId = "com.atuy.colorlyric"
         minSdk = 31
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.4.0-native-unlocker"
+        versionCode = 5
+        versionName = "0.5.0-spotify-hook"
     }
 
     buildTypes {
@@ -28,6 +28,5 @@ android {
 }
 
 dependencies {
-    compileOnly("io.github.libxposed:api:102.0.0")
-    implementation("org.luckypray:dexkit:2.2.0")
+    compileOnly("de.robv.android.xposed:api:82")
 }
