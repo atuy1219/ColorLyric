@@ -34,6 +34,17 @@ final class StockLyricInfo {
         }
     }
 
+    static String rebindGeneration(String value, long generation) {
+        if (value == null || value.isBlank()) return value;
+        try {
+            JSONObject object = new JSONObject(value);
+            object.put("sessionGeneration", generation);
+            return object.toString();
+        } catch (Throwable ignored) {
+            return value;
+        }
+    }
+
     static String build(TrackSnapshot track, String lyric, long generation) {
         return build(track, lyric, null, generation, "", "color-lyrics");
     }
