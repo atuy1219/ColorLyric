@@ -33,7 +33,8 @@ final class StockLyricInfo {
         return build(track.title, track.artist, track.numericSongId(), lyric, "", "");
     }
 
-    private static String build(String title, String artist, long songId, String lyric, String transLyric, String txtLyric) {
+    private static String build(String title, String artist, long songId, String lyric,
+                                String transLyric, String txtLyric) {
         try {
             JSONObject out = new JSONObject();
             out.put("id", 0);
@@ -71,10 +72,15 @@ final class StockLyricInfo {
             this.title = clean(title);
             this.artist = clean(artist);
             this.album = clean(album);
-            this.durationMs = durationMs;
+            this.durationMs = durationMs > 0 ? durationMs : 0L;
+        }
+
+        static TrackSnapshot empty() {
+            return new TrackSnapshot("", "", "", "", 0L);
         }
 
         static TrackSnapshot from(MediaMetadata metadata) {
+            if (metadata == null) return empty();
             return new TrackSnapshot(
                     metadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID),
                     metadata.getString(MediaMetadata.METADATA_KEY_TITLE),
@@ -84,12 +90,45 @@ final class StockLyricInfo {
             );
         }
 
-        boolean isMusicTrack() {
-            return mediaId.startsWith("spotify:track:") && !title.isBlank() && !artist.isBlank()
-                    && durationMs >= 1_000L && durationMs <= 3_600_000L;
+        TrackSnapshot merge(TrackSnapshot incoming) {
+            if (incoming == null) return this;
+            boolean incomingHasId = incoming.hasSpotifyTrackId();
+            boolean thisHasId = hasSpotifyTrackId();
+            if (incomingHasId && thisHasId && !mediaId.equals(incoming.mediaId)) {
+                return incoming;
+            }
+
+            String mergedId = incomingHasId ? incoming.mediaId : mediaId;
+            boolean sameIdentifiedTrack = incomingHasId && thisHasId && mediaId.equals(incoming.mediaId);
+
+            String mergedTitle = choose(title, incoming.title, sameIdentifiedTrack);
+            String mergedArtist = choose(artist, incoming.artist, sameIdentifiedTrack);
+            String mergedAlbum = choose(album, incoming.album, sameIdentifiedTrack);
+            long mergedDuration = durationMs;
+            if (sameIdentifiedTrack && incoming.durationMs > 0) {
+                mergedDuration = incoming.durationMs;
+            } else if (mergedDuration <= 0 && incoming.durationMs > 0) {
+                mergedDuration = incoming.durationMs;
+            }
+
+            return new TrackSnapshot(mergedId, mergedTitle, mergedArtist, mergedAlbum, mergedDuration);
         }
 
-        String key() { return mediaId; }
+        boolean hasSpotifyTrackId() {
+            return mediaId.startsWith("spotify:track:") && mediaId.length() > "spotify:track:".length();
+        }
+
+        boolean hasQueryIdentity() {
+            return hasSpotifyTrackId() && !title.isBlank() && !artist.isBlank();
+        }
+
+        boolean hasDuration() {
+            return durationMs >= 1_000L && durationMs <= 3_600_000L;
+        }
+
+        String key() {
+            return hasSpotifyTrackId() ? mediaId : "";
+        }
 
         long numericSongId() {
             byte[] bytes = mediaId.getBytes(StandardCharsets.UTF_8);
@@ -101,6 +140,22 @@ final class StockLyricInfo {
             return hash & Long.MAX_VALUE;
         }
 
-        private static String clean(String value) { return value == null ? "" : value.trim(); }
+        String debugSummary() {
+            return "id=" + hasSpotifyTrackId()
+                    + " title=" + !title.isBlank()
+                    + " artist=" + !artist.isBlank()
+                    + " album=" + !album.isBlank()
+                    + " duration=" + durationMs;
+        }
+
+        private static String choose(String current, String incoming, boolean sameIdentifiedTrack) {
+            if (sameIdentifiedTrack && incoming != null && !incoming.isBlank()) return incoming;
+            if (current == null || current.isBlank()) return incoming == null ? "" : incoming;
+            return current;
+        }
+
+        private static String clean(String value) {
+            return value == null ? "" : value.trim();
+        }
     }
 }
