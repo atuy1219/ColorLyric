@@ -2,13 +2,15 @@
 package com.atuy.colorlyric;
 
 import android.media.MediaMetadata;
+import android.os.Parcel;
 
 import org.json.JSONObject;
 
-import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 
 final class StockLyricInfo {
     static final String KEY = "lyricInfo";
+    static final int MAX_PARCEL_BYTES = 512 * 1024;
 
     private StockLyricInfo() {}
 
@@ -16,36 +18,27 @@ final class StockLyricInfo {
         if (value == null || value.isBlank()) return null;
         try {
             JSONObject source = new JSONObject(value);
-            String lyric = source.optString("lyric", "");
-            if (lyric.isBlank()) return null;
-            String title = nonBlank(source.optString("songName", ""), track.title);
-            String artist = nonBlank(source.optString("artist", ""), track.artist);
-            String translation = source.optString("transLyric", "");
-            if (translation.isBlank()) translation = source.optString("translationLyric", "");
-            String txtLyric = source.optString("txtLyric", "");
-            return build(title, artist, track.numericSongId(), lyric, translation, txtLyric);
+            return source.optString("lyric", "").isBlank() ? null : value;
         } catch (Throwable ignored) {
             return null;
         }
     }
 
-    static String build(TrackSnapshot track, String lyric) {
-        return build(track.title, track.artist, track.numericSongId(), lyric, "", "");
-    }
-
-    private static String build(String title, String artist, long songId, String lyric,
-                                String transLyric, String txtLyric) {
+    static String build(TrackSnapshot track, String lyric, long generation) {
+        if (track == null || lyric == null || lyric.isBlank()) return null;
         try {
             JSONObject out = new JSONObject();
-            out.put("id", 0);
-            out.put("songName", title == null ? "" : title);
-            out.put("artist", artist == null ? "" : artist);
-            out.put("songId", songId);
+            out.put("songName", track.title);
+            out.put("artist", track.artist);
+            out.put("songId", track.mediaId);
             out.put("lyricType", 0);
-            out.put("lyric", lyric == null ? "" : lyric);
-            out.put("noLyric", lyric == null || lyric.isBlank());
-            out.put("transLyric", transLyric == null ? "" : transLyric);
-            out.put("txtLyric", txtLyric == null ? "" : txtLyric);
+            out.put("id", "");
+            out.put("lyric", lyric);
+            out.put("noLyric", false);
+            out.put("provider", "com.spotify.music");
+            out.put("source", "com.spotify.music-v5");
+            out.put("trackKey", track.stableKey());
+            out.put("sessionGeneration", generation);
             return out.toString();
         } catch (Throwable ignored) {
             return null;
@@ -56,8 +49,17 @@ final class StockLyricInfo {
         return new MediaMetadata.Builder(metadata).putString(KEY, value).build();
     }
 
-    private static String nonBlank(String first, String fallback) {
-        return first != null && !first.isBlank() ? first : (fallback == null ? "" : fallback);
+    static int parcelSize(MediaMetadata metadata) {
+        Parcel parcel = null;
+        try {
+            parcel = Parcel.obtain();
+            metadata.writeToParcel(parcel, 0);
+            return parcel.dataSize();
+        } catch (Throwable ignored) {
+            return -1;
+        } finally {
+            if (parcel != null) parcel.recycle();
+        }
     }
 
     static final class TrackSnapshot {
@@ -94,28 +96,22 @@ final class StockLyricInfo {
             if (incoming == null) return this;
             boolean incomingHasId = incoming.hasSpotifyTrackId();
             boolean thisHasId = hasSpotifyTrackId();
-            if (incomingHasId && thisHasId && !mediaId.equals(incoming.mediaId)) {
-                return incoming;
-            }
+            if (incomingHasId && thisHasId && !mediaId.equals(incoming.mediaId)) return incoming;
 
             String mergedId = incomingHasId ? incoming.mediaId : mediaId;
-            boolean sameIdentifiedTrack = incomingHasId && thisHasId && mediaId.equals(incoming.mediaId);
-
-            String mergedTitle = choose(title, incoming.title, sameIdentifiedTrack);
-            String mergedArtist = choose(artist, incoming.artist, sameIdentifiedTrack);
-            String mergedAlbum = choose(album, incoming.album, sameIdentifiedTrack);
+            boolean sameTrack = incomingHasId && thisHasId && mediaId.equals(incoming.mediaId);
+            String mergedTitle = choose(title, incoming.title, sameTrack);
+            String mergedArtist = choose(artist, incoming.artist, sameTrack);
+            String mergedAlbum = choose(album, incoming.album, sameTrack);
             long mergedDuration = durationMs;
-            if (sameIdentifiedTrack && incoming.durationMs > 0) {
-                mergedDuration = incoming.durationMs;
-            } else if (mergedDuration <= 0 && incoming.durationMs > 0) {
-                mergedDuration = incoming.durationMs;
-            }
-
+            if (sameTrack && incoming.durationMs > 0) mergedDuration = incoming.durationMs;
+            else if (mergedDuration <= 0 && incoming.durationMs > 0) mergedDuration = incoming.durationMs;
             return new TrackSnapshot(mergedId, mergedTitle, mergedArtist, mergedAlbum, mergedDuration);
         }
 
         boolean hasSpotifyTrackId() {
-            return mediaId.startsWith("spotify:track:") && mediaId.length() > "spotify:track:".length();
+            return mediaId.startsWith("spotify:track:")
+                    && mediaId.length() > "spotify:track:".length();
         }
 
         boolean hasQueryIdentity() {
@@ -130,14 +126,10 @@ final class StockLyricInfo {
             return hasSpotifyTrackId() ? mediaId : "";
         }
 
-        long numericSongId() {
-            byte[] bytes = mediaId.getBytes(StandardCharsets.UTF_8);
-            long hash = 0xcbf29ce484222325L;
-            for (byte value : bytes) {
-                hash ^= value & 0xffL;
-                hash *= 0x100000001b3L;
-            }
-            return hash & Long.MAX_VALUE;
+        String stableKey() {
+            long seconds = durationMs > 0 ? durationMs / 1000L : 0L;
+            return mediaId + "|" + title.toLowerCase(Locale.ROOT) + "|"
+                    + artist.toLowerCase(Locale.ROOT) + "|" + seconds;
         }
 
         String debugSummary() {
@@ -148,8 +140,8 @@ final class StockLyricInfo {
                     + " duration=" + durationMs;
         }
 
-        private static String choose(String current, String incoming, boolean sameIdentifiedTrack) {
-            if (sameIdentifiedTrack && incoming != null && !incoming.isBlank()) return incoming;
+        private static String choose(String current, String incoming, boolean sameTrack) {
+            if (sameTrack && incoming != null && !incoming.isBlank()) return incoming;
             if (current == null || current.isBlank()) return incoming == null ? "" : incoming;
             return current;
         }
