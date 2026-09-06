@@ -10,8 +10,8 @@ android {
         applicationId = "com.atuy.colorlyric"
         minSdk = 31
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.7.0-spotify-only"
+        versionCode = 8
+        versionName = "0.8.0-spotify-only"
     }
 
     buildTypes {
