@@ -11,7 +11,7 @@ android {
         minSdk = 31
         targetSdk = 36
         versionCode = 5
-        versionName = "0.5.0-spotify-hook"
+        versionName = "0.5.0-spotify-only"
     }
 
     buildTypes {

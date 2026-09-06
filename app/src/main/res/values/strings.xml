@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">ColorLyric</string>
-    <string name="module_description">Enable QQ Music-style ColorOS lyric metadata in Spotify</string>
+    <string name="module_description">SpotifyへColorOS純正互換のロック画面歌詞metadataを追加します</string>
 </resources>

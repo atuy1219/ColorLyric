@@ -1,61 +1,78 @@
-# ColorLyric 0.5 - Spotify Hook
+# ColorLyric
 
-ColorLyric is an experimental Xposed module for ColorOS/OxygenOS lock-screen lyrics.
+ColorLyric is a Spotify-only Xposed module for ColorOS/OxygenOS lock-screen lyrics.
+It hooks `com.spotify.music` only. `com.android.systemui` is not in scope.
 
-This branch **does not hook `com.android.systemui`**. It hooks only Spotify (`com.spotify.music`) and augments Spotify's own MediaSession metadata to more closely match the ColorOS/OPlus metadata emitted by QQ Music.
+## Goal
 
-## Why this version exists
+QQ Music on OPlus API 37+ publishes a stock `lyricInfo` object through its MediaSession.
+ColorLyric makes Spotify publish the same core schema:
 
-QQ Music's ColorOS path was reverse-engineered from an official QQ Music APK. On OPlus API 37+ its `addDataForOplusSeedling` path adds two relevant metadata entries to the player's MediaSession:
-
-- `lyricInfo`
-- `ratingUri`
-
-QQ Music's `action_lyric` PlaybackState custom action is only emitted on the HyperOS branch, so ColorLyric intentionally does **not** add that action on ColorOS/OxygenOS.
-
-## Current experiment
-
-For now, keep **Spotify Lyric Provider** enabled for Spotify. It supplies the timed `lyricInfo`. ColorLyric then, inside the Spotify process:
-
-1. observes Spotify `MediaSession#setMetadata`;
-2. waits until `lyricInfo` is present;
-3. normalizes several QQ-compatible fields (`id`, `lyricType`, `noLyric`, `transLyric`, `txtLyric`);
-4. adds `ratingUri` when Spotify does not already provide it;
-5. republishes the metadata through the same Spotify-owned MediaSession when necessary.
-
-This deliberately isolates the remaining native-UI compatibility difference before duplicating the provider's lyric-fetching stack.
-
-## LSPosed scope
-
-Select **only**:
-
-```text
-com.spotify.music
+```json
+{
+  "id": 0,
+  "songName": "...",
+  "artist": "...",
+  "songId": 123,
+  "lyricType": 0,
+  "lyric": "[00:01.00]...",
+  "noLyric": false,
+  "transLyric": "",
+  "txtLyric": ""
+}
 ```
 
-Do not select SystemUI.
+This is intentionally an app-side experiment. If the stock lyric-page entrance still does not
+appear with this exact contract, the remaining gate is very likely package policy inside OPlus
+SystemUI and cannot be solved by metadata formatting alone.
 
-After changing the scope, force-stop Spotify or reboot.
+## Lyric source
 
-## Debug
+- If another Spotify Provider already published `MediaMetadata["lyricInfo"]`, ColorLyric normalizes
+  that payload to the QQ Music stock schema.
+- Otherwise ColorLyric queries LRCLIB `/api/get` using Spotify's public MediaSession metadata and
+  only accepts an exact title/artist match with duration within 2 seconds.
+
+No Spotify account token, cookie, private API, or SystemUI hook is used.
+
+## Installation
+
+1. Install ColorLyric.
+2. Enable only `com.spotify.music` in LSPosed.
+3. Do not add `com.android.systemui` to the scope.
+4. Force-stop Spotify and start it again.
+5. Play a normal `spotify:track:` item with synced lyrics.
+6. Lock the device and check the media card for the stock lyric-page entrance.
+
+Debug:
 
 ```sh
 adb logcat -s ColorLyric
 ```
 
-Expected messages:
+Expected logs include:
 
 ```text
-Loaded in Spotify process; SystemUI scope is not used
-Hooked android.media.session.MediaSession#setMetadata in Spotify only
-Normalized incoming Spotify metadata: lyricInfo + QQ/OPlus compatibility fields
-Replayed Spotify MediaSession metadata after lyricInfo became available
+loaded in Spotify main process
+QQ schema applied from existing lyricInfo: ...
 ```
 
-## Credits
+or, without another Provider:
 
-The Spotify MediaSession/`lyricInfo` architecture was studied using `io.github.andrealtb.coloroslyrics.provider.spotify` from **ColorOS Live Lyrics Providers** by Andrea-lyz/Andrea-TB. ColorLyric's implementation in this repository is independent and focused on the QQ Music/OPlus metadata delta rather than copying the Provider implementation.
+```text
+stock lyricInfo published: ...
+```
+
+## Research notes
+
+The QQ Music Android implementation was inspected to determine the stock OPlus metadata contract.
+Its `addDataForOplusSeedling` path writes `ratingUri` conditionally and writes the `lyricInfo`
+object above; the feature is enabled when `ro.build.version.oplus.api >= 37`.
+
+The public `io.github.andrealtb.coloroslyrics.provider.spotify` implementation was consulted for
+architecture and compatibility research only. ColorLyric's hook and LRCLIB path are independently
+implemented.
 
 ## License
 
-GNU General Public License v3.0 (`GPL-3.0-only`).
+GNU General Public License v3.0 only (`GPL-3.0-only`).

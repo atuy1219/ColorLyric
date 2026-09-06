@@ -8,20 +8,22 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        TextView text = new TextView(this);
-        int p = Math.round(24 * getResources().getDisplayMetrics().density);
-        text.setPadding(p, p, p, p);
-        text.setTextSize(16);
-        text.setText(
-                "ColorLyric 0.5 - Spotify Hook\n\n" +
-                "LSPosed scope: com.spotify.music only\n\n" +
-                "SystemUI is not hooked. This build augments Spotify's own MediaSession metadata " +
-                "with the ColorOS/OPlus fields used by QQ Music.\n\n" +
-                "For this experimental build, keep Spotify Lyric Provider enabled so lyricInfo is " +
-                "available. ColorLyric normalizes that payload and adds the QQ-style OPlus ratingUri.\n\n" +
-                "After changing scope, force-stop Spotify or reboot.\n\n" +
+        TextView view = new TextView(this);
+        int padding = (int) (24 * getResources().getDisplayMetrics().density);
+        view.setPadding(padding, padding, padding, padding);
+        view.setTextSize(16);
+        view.setText(
+                "ColorLyric 0.5.0\n\n" +
+                "Spotify-only Xposed module\n" +
+                "Scope: com.spotify.music\n" +
+                "SystemUI is not hooked.\n\n" +
+                "SpotifyのMediaSessionにColorOS純正互換のlyricInfoを発行します。\n" +
+                "既存のSpotify Lyric ProviderがlyricInfoを出している場合は、" +
+                "QQ Musicと同じstock schemaへ正規化します。\n" +
+                "Providerが無い場合はLRCLIBの同期歌詞を使用します。\n\n" +
+                "LSPosedでSpotifyだけを作用域にして、Spotifyを強制停止後に起動してください。\n\n" +
                 "Debug: adb logcat -s ColorLyric"
         );
-        setContentView(text);
+        setContentView(view);
     }
 }
