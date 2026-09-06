@@ -6,37 +6,48 @@ import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.util.Log;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import io.github.libxposed.api.XposedInterface;
+import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.XposedModuleInterface;
 
-public final class SpotifyHookEntry implements IXposedHookLoadPackage {
+public final class SpotifyHookEntry extends XposedModule {
     private static final String TAG = "ColorLyric";
     private static final String SPOTIFY = "com.spotify.music";
-    private static final Object STATE_LOCK = new Object();
-    private static final ThreadLocal<Boolean> MODULE_WRITE = new ThreadLocal<>();
-    private static final AtomicLong GENERATION = new AtomicLong();
-    private static final Set<String> IN_FLIGHT = ConcurrentHashMap.newKeySet();
-    private static final SpotifySessionRegistry REGISTRY = new SpotifySessionRegistry();
-    private static final ScheduledExecutorService EXECUTOR = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread thread = new Thread(r, "ColorLyric-SpotifyLyrics");
-        thread.setDaemon(true);
-        return thread;
+
+    private final Object stateLock = new Object();
+    private final ThreadLocal<Boolean> moduleWrite = new ThreadLocal<>();
+    private final ThreadLocal<Boolean> discoveryGuard = new ThreadLocal<>();
+    private final AtomicLong generation = new AtomicLong();
+    private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+    private final Map<String, SpotifyColorLyricsClient.FetchCall> activeCalls = new ConcurrentHashMap<>();
+    private final SpotifySessionRegistry registry = new SpotifySessionRegistry();
+    private final AtomicInteger workerIndex = new AtomicInteger();
+    private final ExecutorService executor = Executors.newFixedThreadPool(2, new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable,
+                    "ColorLyric-SpotifyLyrics-" + workerIndex.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        }
     });
-    private static final Map<String, String> CACHE = Collections.synchronizedMap(
+    private final Map<String, String> cache = Collections.synchronizedMap(
             new LinkedHashMap<String, String>(32, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
@@ -44,139 +55,359 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
                 }
             }
     );
+    private final Map<String, Long> negativeCache = Collections.synchronizedMap(
+            new LinkedHashMap<String, Long>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+                    return size() > 64;
+                }
+            }
+    );
+    private final Set<String> hookedHeaderClasses = ConcurrentHashMap.newKeySet();
+    private final Set<String> hookedHeaderMethods = ConcurrentHashMap.newKeySet();
+    private final Set<XposedInterface.HookHandle> headerWatcherHandles =
+            Collections.synchronizedSet(new HashSet<>());
 
-    private static volatile String currentTrackKey = "";
-    private static volatile StockLyricInfo.TrackSnapshot currentTrack = StockLyricInfo.TrackSnapshot.empty();
-    private static volatile String committedTrackKey = "";
-    private static volatile long committedGeneration = -1L;
-    private static volatile boolean missingHeadersLogged;
+    private volatile String currentTrackKey = "";
+    private volatile StockLyricInfo.TrackSnapshot currentTrack = StockLyricInfo.TrackSnapshot.empty();
+    private volatile String committedTrackKey = "";
+    private volatile long committedGeneration = -1L;
+    private volatile boolean missingHeadersLogged;
+    private volatile boolean hooksInstalled;
+    private volatile boolean headerContainerHooked;
+    private volatile boolean headerWatcherInstalled;
 
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!SPOTIFY.equals(lpparam.packageName) || !SPOTIFY.equals(lpparam.processName)) return;
-        log("loaded in Spotify main process; SystemUI not hooked");
-
-        installMediaSessionHooks();
-        installSpotifyHeaderHooks(lpparam.classLoader);
-        log("Spotify hooks installed");
+    public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
+        if (!SPOTIFY.equals(param.getProcessName())) {
+            detach();
+            return;
+        }
+        info("loaded in Spotify main process; API=" + getApiVersion());
     }
 
-    private static void installMediaSessionHooks() {
-        XposedBridge.hookAllConstructors(MediaSession.class, new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam param) {
-                if (!(param.thisObject instanceof MediaSession)) return;
-                MediaSession session = (MediaSession) param.thisObject;
-                String tag = SpotifySessionRegistry.constructorTag(param.args);
-                REGISTRY.onConstructed(session, tag);
-                log("session constructed tag=" + tag + " cast=" + SpotifySessionRegistry.isCastTag(tag));
-            }
-        });
-
-        XposedBridge.hookAllMethods(MediaSession.class, "setMetadata", new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                if (Boolean.TRUE.equals(MODULE_WRITE.get())) return;
-                if (!(param.thisObject instanceof MediaSession) || param.args.length == 0
-                        || !(param.args[0] instanceof MediaMetadata)) return;
-                onMetadata((MediaSession) param.thisObject, (MediaMetadata) param.args[0], param);
-            }
-        });
-
-        XposedBridge.hookAllMethods(MediaSession.class, "setPlaybackState", new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam param) {
-                if (!(param.thisObject instanceof MediaSession) || param.args.length == 0
-                        || !(param.args[0] instanceof PlaybackState)) return;
-                MediaSession session = (MediaSession) param.thisObject;
-                REGISTRY.onPlaybackState(session, ((PlaybackState) param.args[0]).getState());
-                publishCachedOnceIfReady(session, "playback-ready");
-            }
-        });
-
-        XposedBridge.hookAllMethods(MediaSession.class, "setActive", new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam param) {
-                if (!(param.thisObject instanceof MediaSession) || param.args.length == 0
-                        || !(param.args[0] instanceof Boolean)) return;
-                MediaSession session = (MediaSession) param.thisObject;
-                REGISTRY.onActive(session, (Boolean) param.args[0]);
-                publishCachedOnceIfReady(session, "active-ready");
-            }
-        });
-
-        XposedBridge.hookAllMethods(MediaSession.class, "release", new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                if (param.thisObject instanceof MediaSession) {
-                    REGISTRY.onReleased((MediaSession) param.thisObject);
-                }
-            }
-        });
+    @Override
+    public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
+        if (!SPOTIFY.equals(param.getPackageName()) || hooksInstalled) return;
+        synchronized (this) {
+            if (hooksInstalled) return;
+            hooksInstalled = true;
+            installMediaSessionHooks();
+            installSpotifyHeaderHooks(param.getClassLoader());
+            info("Spotify hooks installed");
+        }
     }
 
-    private static void installSpotifyHeaderHooks(ClassLoader classLoader) {
+    private void installMediaSessionHooks() {
+        for (Constructor<?> constructor : MediaSession.class.getDeclaredConstructors()) {
+            constructor.setAccessible(true);
+            hook(constructor)
+                    .setId("colorlyric-spotify-session-ctor")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        Object instance = chain.getThisObject();
+                        if (instance instanceof MediaSession) {
+                            MediaSession session = (MediaSession) instance;
+                            String tag = SpotifySessionRegistry.constructorTag(
+                                    chain.getArgs().toArray());
+                            registry.onConstructed(session, tag);
+                            info("session constructed tag=" + tag
+                                    + " cast=" + SpotifySessionRegistry.isCastTag(tag));
+                        }
+                        return result;
+                    });
+        }
+
+        try {
+            Method method = MediaSession.class.getDeclaredMethod("setMetadata", MediaMetadata.class);
+            method.setAccessible(true);
+            hook(method)
+                    .setId("colorlyric-spotify-set-metadata")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        if (Boolean.TRUE.equals(moduleWrite.get())) return chain.proceed();
+                        Object instance = chain.getThisObject();
+                        Object incoming = chain.getArg(0);
+                        if (!(instance instanceof MediaSession) || !(incoming instanceof MediaMetadata)) {
+                            return chain.proceed();
+                        }
+                        MediaMetadata outgoing = onMetadata(
+                                (MediaSession) instance, (MediaMetadata) incoming);
+                        if (outgoing == incoming) return chain.proceed();
+                        Object[] args = chain.getArgs().toArray();
+                        args[0] = outgoing;
+                        return chain.proceed(args);
+                    });
+        } catch (ReflectiveOperationException error) {
+            info("setMetadata hook unavailable: " + error.getClass().getSimpleName());
+        }
+
+        try {
+            Method method = MediaSession.class.getDeclaredMethod(
+                    "setPlaybackState", PlaybackState.class);
+            method.setAccessible(true);
+            hook(method)
+                    .setId("colorlyric-spotify-set-playback-state")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        Object instance = chain.getThisObject();
+                        Object state = chain.getArg(0);
+                        if (instance instanceof MediaSession && state instanceof PlaybackState) {
+                            MediaSession session = (MediaSession) instance;
+                            registry.onPlaybackState(session, ((PlaybackState) state).getState());
+                            publishCachedOnceIfReady(session, "playback-ready");
+                        }
+                        return result;
+                    });
+        } catch (ReflectiveOperationException error) {
+            info("setPlaybackState hook unavailable: " + error.getClass().getSimpleName());
+        }
+
+        try {
+            Method method = MediaSession.class.getDeclaredMethod("setActive", boolean.class);
+            method.setAccessible(true);
+            hook(method)
+                    .setId("colorlyric-spotify-set-active")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        Object instance = chain.getThisObject();
+                        Object active = chain.getArg(0);
+                        if (instance instanceof MediaSession && active instanceof Boolean) {
+                            MediaSession session = (MediaSession) instance;
+                            registry.onActive(session, (Boolean) active);
+                            publishCachedOnceIfReady(session, "active-ready");
+                        }
+                        return result;
+                    });
+        } catch (ReflectiveOperationException error) {
+            info("setActive hook unavailable: " + error.getClass().getSimpleName());
+        }
+
+        try {
+            Method method = MediaSession.class.getDeclaredMethod("release");
+            method.setAccessible(true);
+            hook(method)
+                    .setId("colorlyric-spotify-release")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object instance = chain.getThisObject();
+                        if (instance instanceof MediaSession) {
+                            registry.onReleased((MediaSession) instance);
+                        }
+                        return chain.proceed();
+                    });
+        } catch (ReflectiveOperationException error) {
+            info("release hook unavailable: " + error.getClass().getSimpleName());
+        }
+    }
+
+    private void installSpotifyHeaderHooks(ClassLoader classLoader) {
         int installed = 0;
-        installed += hookHeaderContainer(classLoader, "p.ot10");
-        installed += hookHeaderContainer(classLoader, "okhttp3.Headers");
+        installed += hookKnownHeaderContainer(classLoader, "p.ot10");
+        installed += hookKnownHeaderContainer(classLoader, "okhttp3.Headers");
         installed += hookAddHeader(classLoader, "p.aj81");
         installed += hookAddHeader(classLoader, "org.chromium.net.UrlRequest$Builder");
-        log("Spotify auth header hooks installed=" + installed);
+
+        if (!headerContainerHooked) {
+            installHeaderClassLoadWatcher();
+        }
+        info("Spotify auth header hooks installed=" + installed
+                + " structuralWatcher=" + headerWatcherInstalled);
     }
 
-    private static int hookHeaderContainer(ClassLoader classLoader, String className) {
+    private int hookKnownHeaderContainer(ClassLoader classLoader, String className) {
         try {
-            Class<?> type = classLoader.loadClass(className);
-            XposedBridge.hookAllConstructors(type, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    boolean becameReady = false;
-                    if (param.args != null) {
-                        for (Object arg : param.args) {
-                            becameReady |= SpotifyHeaderStore.ingestPairs(arg);
-                        }
-                    }
-                    becameReady |= captureStringArrayFields(param.thisObject);
-                    if (becameReady) onHeadersReady();
-                }
-            });
-            log("header container hook=" + className);
-            return 1;
+            Class<?> type = Class.forName(className, false, classLoader);
+            return hookHeaderContainer(type, false);
         } catch (Throwable ignored) {
             return 0;
         }
     }
 
-    private static int hookAddHeader(ClassLoader classLoader, String className) {
+    private int hookHeaderContainer(Class<?> type, boolean requireStructuralMatch) {
+        if (type == null) return 0;
+        if (requireStructuralMatch && !isShadedHeadersType(type)) return 0;
+        if (!hasInstanceStringArrayField(type)) return 0;
+        if (!hookedHeaderClasses.add(type.getName())) return 0;
+
+        int count = 0;
+        for (Constructor<?> constructor : type.getDeclaredConstructors()) {
+            if (requireStructuralMatch
+                    && !(constructor.getParameterCount() == 1
+                    && constructor.getParameterTypes()[0] == String[].class)) {
+                continue;
+            }
+            try {
+                constructor.setAccessible(true);
+                hook(constructor)
+                        .setId("colorlyric-header-container")
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            Object result = chain.proceed();
+                            boolean becameReady = false;
+                            for (Object arg : chain.getArgs()) {
+                                becameReady |= SpotifyHeaderStore.ingestPairs(arg);
+                            }
+                            becameReady |= captureStringArrayFields(chain.getThisObject());
+                            if (becameReady) onHeadersReady();
+                            return result;
+                        });
+                count++;
+            } catch (Throwable error) {
+                info("header constructor hook failed " + type.getName() + ": "
+                        + error.getClass().getSimpleName());
+            }
+        }
+
+        if (count > 0) {
+            headerContainerHooked = true;
+            info("header container hook=" + type.getName() + " constructors=" + count);
+            removeHeaderClassLoadWatcher();
+            return count;
+        }
+        hookedHeaderClasses.remove(type.getName());
+        return 0;
+    }
+
+    private int hookAddHeader(ClassLoader classLoader, String className) {
         try {
-            Class<?> type = classLoader.loadClass(className);
+            Class<?> type = Class.forName(className, false, classLoader);
             int count = 0;
             for (Method method : type.getDeclaredMethods()) {
                 if (!"addHeader".equals(method.getName()) || method.getParameterCount() != 2) continue;
                 Class<?>[] parameters = method.getParameterTypes();
                 if (parameters[0] != String.class || parameters[1] != String.class) continue;
-                XposedBridge.hookMethod(method, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        String name = param.args[0] instanceof String ? (String) param.args[0] : null;
-                        String value = param.args[1] instanceof String ? (String) param.args[1] : null;
-                        if (SpotifyHeaderStore.ingest(name, value)) onHeadersReady();
-                    }
-                });
+                String key = type.getName() + "#" + method.toGenericString();
+                if (!hookedHeaderMethods.add(key)) continue;
+                method.setAccessible(true);
+                hook(method)
+                        .setId("colorlyric-add-header")
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            String name = chain.getArg(0) instanceof String
+                                    ? (String) chain.getArg(0) : null;
+                            String value = chain.getArg(1) instanceof String
+                                    ? (String) chain.getArg(1) : null;
+                            if (SpotifyHeaderStore.ingest(name, value)) onHeadersReady();
+                            return chain.proceed();
+                        });
                 count++;
             }
-            if (count > 0) log("addHeader hook=" + className + " methods=" + count);
+            if (count > 0) info("addHeader hook=" + className + " methods=" + count);
             return count;
         } catch (Throwable ignored) {
             return 0;
         }
     }
 
-    private static boolean captureStringArrayFields(Object object) {
+    private void installHeaderClassLoadWatcher() {
+        if (headerWatcherInstalled) return;
+        synchronized (this) {
+            if (headerWatcherInstalled) return;
+            headerWatcherInstalled = true;
+            for (Method method : ClassLoader.class.getDeclaredMethods()) {
+                if (!"loadClass".equals(method.getName())) continue;
+                if (method.getParameterCount() < 1 || method.getParameterTypes()[0] != String.class) {
+                    continue;
+                }
+                try {
+                    method.setAccessible(true);
+                    XposedInterface.HookHandle handle = hook(method)
+                            .setId("colorlyric-spotify-header-discovery")
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .intercept(chain -> {
+                                Object result = chain.proceed();
+                                if (!(result instanceof Class<?>)) return result;
+                                if (Boolean.TRUE.equals(discoveryGuard.get())) return result;
+                                discoveryGuard.set(Boolean.TRUE);
+                                try {
+                                    hookHeaderContainer((Class<?>) result, true);
+                                } finally {
+                                    discoveryGuard.remove();
+                                }
+                                return result;
+                            });
+                    headerWatcherHandles.add(handle);
+                } catch (Throwable error) {
+                    info("header discovery watcher method failed: "
+                            + error.getClass().getSimpleName());
+                }
+            }
+            if (headerWatcherHandles.isEmpty()) {
+                headerWatcherInstalled = false;
+                info("header discovery watcher unavailable");
+            } else {
+                info("structural header discovery watcher installed");
+            }
+        }
+    }
+
+    private void removeHeaderClassLoadWatcher() {
+        synchronized (this) {
+            if (headerWatcherHandles.isEmpty()) return;
+            for (XposedInterface.HookHandle handle : new HashSet<>(headerWatcherHandles)) {
+                try {
+                    handle.unhook();
+                } catch (Throwable ignored) {
+                }
+            }
+            headerWatcherHandles.clear();
+            headerWatcherInstalled = false;
+            info("structural header discovery watcher removed");
+        }
+    }
+
+    private static boolean isShadedHeadersType(Class<?> type) {
+        if (Modifier.isAbstract(type.getModifiers()) || !Iterable.class.isAssignableFrom(type)) {
+            return false;
+        }
+        int stringArrayFields = 0;
+        for (Field field : type.getDeclaredFields()) {
+            if (!Modifier.isStatic(field.getModifiers()) && field.getType() == String[].class) {
+                stringArrayFields++;
+            }
+        }
+        if (stringArrayFields != 1) return false;
+
+        boolean hasIterator = false;
+        boolean hasStringLookup = false;
+        for (Method method : type.getDeclaredMethods()) {
+            if ("iterator".equals(method.getName()) && method.getParameterCount() == 0) {
+                hasIterator = true;
+            }
+            if (method.getReturnType() == String.class
+                    && method.getParameterCount() == 1
+                    && method.getParameterTypes()[0] == String.class) {
+                hasStringLookup = true;
+            }
+        }
+        if (!hasIterator || !hasStringLookup) return false;
+
+        for (Constructor<?> constructor : type.getDeclaredConstructors()) {
+            if (constructor.getParameterCount() == 1
+                    && constructor.getParameterTypes()[0] == String[].class) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasInstanceStringArrayField(Class<?> type) {
+        for (Field field : type.getDeclaredFields()) {
+            if (!Modifier.isStatic(field.getModifiers()) && field.getType() == String[].class) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean captureStringArrayFields(Object object) {
         if (object == null) return false;
         boolean becameReady = false;
-        Class<?> type = object.getClass();
-        for (Field field : type.getDeclaredFields()) {
+        for (Field field : object.getClass().getDeclaredFields()) {
             if (Modifier.isStatic(field.getModifiers()) || field.getType() != String[].class) continue;
             try {
                 field.setAccessible(true);
@@ -187,16 +418,16 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
         return becameReady;
     }
 
-    private static void onHeadersReady() {
+    private void onHeadersReady() {
         missingHeadersLogged = false;
-        log("Spotify auth headers ready keys=" + SpotifyHeaderStore.capturedKeys());
+        removeHeaderClassLoadWatcher();
+        info("Spotify auth headers ready keys=" + SpotifyHeaderStore.capturedKeys());
         scheduleCurrentFetch("headers-ready");
     }
 
-    private static void onMetadata(MediaSession session, MediaMetadata metadata,
-                                   XC_MethodHook.MethodHookParam param) {
-        StockLyricInfo.TrackSnapshot sessionTrack = REGISTRY.onHostMetadata(session, metadata);
-        if (REGISTRY.isCast(session)) return;
+    private MediaMetadata onMetadata(MediaSession session, MediaMetadata metadata) {
+        StockLyricInfo.TrackSnapshot sessionTrack = registry.onHostMetadata(session, metadata);
+        if (registry.isCast(session)) return metadata;
 
         Observation observation = observe(sessionTrack);
         StockLyricInfo.TrackSnapshot track = observation.track;
@@ -205,39 +436,44 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
         if (existing != null && !existing.isBlank()) {
             String accepted = StockLyricInfo.normalize(existing, track);
             if (accepted != null && track.hasSpotifyTrackId()) {
-                CACHE.put(track.key(), accepted);
+                cache.put(track.key(), accepted);
                 markCommitted(track.key(), observation.generation);
-                log("existing native lyricInfo observed: " + shortId(track.mediaId));
+                info("existing native lyricInfo observed: " + shortId(track.mediaId));
+                return metadata;
             }
-            return;
+            if (track.hasSpotifyTrackId()) {
+                info("stale or invalid lyricInfo ignored: " + shortId(track.mediaId));
+            }
         }
 
-        if (!track.hasSpotifyTrackId()) return;
+        if (!track.hasSpotifyTrackId()) return metadata;
 
-        String cached = CACHE.get(track.key());
+        String cached = cache.get(track.key());
         if (cached != null) {
+            cached = StockLyricInfo.rebindGeneration(cached, observation.generation);
             MediaMetadata patched = StockLyricInfo.withLyricInfo(metadata, cached);
             int parcelBytes = StockLyricInfo.parcelSize(patched);
             if (parcelBytes > 0 && parcelBytes <= StockLyricInfo.MAX_PARCEL_BYTES) {
-                param.args[0] = patched;
-                REGISTRY.onHostMetadata(session, patched);
+                registry.onHostMetadata(session, patched);
                 markCommitted(track.key(), observation.generation);
-                log("cached official lyricInfo attached to host metadata: " + shortId(track.mediaId)
-                        + " parcel=" + parcelBytes);
+                info("cached official lyricInfo attached to host metadata: "
+                        + shortId(track.mediaId) + " parcel=" + parcelBytes);
+                return patched;
             }
-            return;
+            return metadata;
         }
 
         if (!track.hasQueryIdentity()) {
-            log("metadata incomplete: " + track.debugSummary());
-            return;
+            info("metadata incomplete: " + track.debugSummary());
+            return metadata;
         }
 
         scheduleFetch(track.key(), observation.generation, "metadata");
+        return metadata;
     }
 
-    private static Observation observe(StockLyricInfo.TrackSnapshot incoming) {
-        synchronized (STATE_LOCK) {
+    private Observation observe(StockLyricInfo.TrackSnapshot incoming) {
+        synchronized (stateLock) {
             boolean incomingHasId = incoming.hasSpotifyTrackId();
             if (incomingHasId && !incoming.mediaId.equals(currentTrackKey)) {
                 currentTrackKey = incoming.mediaId;
@@ -245,10 +481,12 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
                 committedTrackKey = "";
                 committedGeneration = -1L;
                 missingHeadersLogged = false;
-                long generation = GENERATION.incrementAndGet();
-                log("track=" + shortId(incoming.mediaId) + " generation=" + generation
+                long nextGeneration = generation.incrementAndGet();
+                String requestKey = SpotifyFetchPolicy.requestKey(currentTrackKey, nextGeneration);
+                cancelStaleFetches(requestKey);
+                info("track=" + shortId(incoming.mediaId) + " generation=" + nextGeneration
                         + " " + incoming.debugSummary());
-                return new Observation(currentTrack, generation);
+                return new Observation(currentTrack, nextGeneration);
             }
 
             if (incomingHasId && incoming.mediaId.equals(currentTrackKey)) {
@@ -258,42 +496,61 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
             } else if (currentTrackKey.isBlank()) {
                 currentTrack = incoming;
             }
-            return new Observation(currentTrack, GENERATION.get());
+            return new Observation(currentTrack, generation.get());
         }
     }
 
-    private static void scheduleCurrentFetch(String reason) {
+    private void scheduleCurrentFetch(String reason) {
         StockLyricInfo.TrackSnapshot track;
         String trackKey;
-        long generation;
-        synchronized (STATE_LOCK) {
+        long currentGeneration;
+        synchronized (stateLock) {
             track = currentTrack;
             trackKey = currentTrackKey;
-            generation = GENERATION.get();
+            currentGeneration = generation.get();
         }
         if (track == null || trackKey.isBlank() || !track.hasQueryIdentity()) return;
-        scheduleFetch(trackKey, generation, reason);
+        scheduleFetch(trackKey, currentGeneration, reason);
     }
 
-    private static void scheduleFetch(String trackKey, long generation, String reason) {
+    private void scheduleFetch(String trackKey, long currentGeneration, String reason) {
         if (!SpotifyHeaderStore.isReady()) {
             if (!missingHeadersLogged) {
                 missingHeadersLogged = true;
-                log("Spotify Color Lyrics waiting for auth headers keys="
+                info("Spotify Color Lyrics waiting for auth headers keys="
                         + SpotifyHeaderStore.capturedKeys());
             }
             return;
         }
-        if (!IN_FLIGHT.add(trackKey)) return;
 
-        EXECUTOR.execute(() -> {
+        long now = System.currentTimeMillis();
+        Long negativeUntil = negativeCache.get(trackKey);
+        if (SpotifyFetchPolicy.isNegativeCached(negativeUntil, now)) return;
+        if (negativeUntil != null) negativeCache.remove(trackKey);
+
+        String requestKey = SpotifyFetchPolicy.requestKey(trackKey, currentGeneration);
+        if (!inFlight.add(requestKey)) return;
+
+        SpotifyColorLyricsClient.FetchCall call = new SpotifyColorLyricsClient.FetchCall();
+        activeCalls.put(requestKey, call);
+        executor.execute(() -> {
             try {
-                StockLyricInfo.TrackSnapshot track = snapshotCurrent(trackKey, generation);
-                if (track == null || CACHE.containsKey(trackKey)) return;
+                StockLyricInfo.TrackSnapshot track = snapshotCurrent(trackKey, currentGeneration);
+                if (track == null || call.isCancelled()) return;
+
+                String cached = cache.get(trackKey);
+                if (cached != null) {
+                    publish(trackKey, currentGeneration,
+                            StockLyricInfo.rebindGeneration(cached, currentGeneration),
+                            "cache-before-fetch");
+                    return;
+                }
 
                 SpotifyColorLyricsClient.Result result = SpotifyColorLyricsClient.fetch(
-                        track, SpotifyHeaderStore.snapshot());
-                log("Spotify Color Lyrics outcome=" + result.outcome
+                        track, SpotifyHeaderStore.snapshot(), call);
+                if ("cancelled".equals(result.outcome)) return;
+
+                info("Spotify Color Lyrics outcome=" + result.outcome
                         + " syncType=" + result.syncType
                         + " source=" + result.source
                         + " reason=" + reason
@@ -304,62 +561,84 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
                     missingHeadersLogged = false;
                     return;
                 }
+
+                long ttl = SpotifyFetchPolicy.negativeTtlMs(result.outcome);
+                if (ttl > 0L) {
+                    negativeCache.put(trackKey, System.currentTimeMillis() + ttl);
+                    return;
+                }
                 if (!result.isSuccess()) return;
 
                 String payload = StockLyricInfo.build(
                         track,
                         result.lineLyric,
                         result.rawLyric,
-                        generation,
+                        currentGeneration,
                         result.syncType,
                         result.source);
-                if (payload == null || !isCurrent(trackKey, generation)) return;
-                CACHE.put(trackKey, payload);
-                publish(trackKey, generation, payload, "spotify-color-lyrics");
+                if (payload == null || !isCurrent(trackKey, currentGeneration)) return;
+                negativeCache.remove(trackKey);
+                cache.put(trackKey, payload);
+                publish(trackKey, currentGeneration, payload, "spotify-color-lyrics");
             } catch (Throwable error) {
-                log("Spotify Color Lyrics fetch failed: "
-                        + error.getClass().getSimpleName() + ": " + error.getMessage());
+                if (!call.isCancelled()) {
+                    info("Spotify Color Lyrics fetch failed: "
+                            + error.getClass().getSimpleName() + ": " + error.getMessage());
+                }
             } finally {
-                IN_FLIGHT.remove(trackKey);
+                activeCalls.remove(requestKey, call);
+                inFlight.remove(requestKey);
             }
         });
     }
 
-    private static void publishCachedOnceIfReady(MediaSession session, String reason) {
-        if (Boolean.TRUE.equals(MODULE_WRITE.get())) return;
-        SpotifySessionRegistry.Selection selection = REGISTRY.selectionFor(session);
+    private void cancelStaleFetches(String currentRequestKey) {
+        for (Map.Entry<String, SpotifyColorLyricsClient.FetchCall> entry : activeCalls.entrySet()) {
+            if (entry.getKey().equals(currentRequestKey)) continue;
+            entry.getValue().cancel();
+        }
+    }
+
+    private void publishCachedOnceIfReady(MediaSession session, String reason) {
+        if (Boolean.TRUE.equals(moduleWrite.get())) return;
+        SpotifySessionRegistry.Selection selection = registry.selectionFor(session);
         if (selection == null || !selection.track.hasSpotifyTrackId()) return;
         if (!selection.active || !SpotifySessionRegistry.isPlaybackStateValid(selection.playbackState)) return;
 
         String trackKey = selection.track.key();
-        long generation = GENERATION.get();
-        if (!isCurrent(trackKey, generation) || isCommitted(trackKey, generation)) return;
+        long currentGeneration = generation.get();
+        if (!isCurrent(trackKey, currentGeneration) || isCommitted(trackKey, currentGeneration)) return;
 
-        String payload = CACHE.get(trackKey);
+        String payload = cache.get(trackKey);
         if (payload == null) return;
-        publishToSelection(trackKey, generation, payload, selection, reason);
+        payload = StockLyricInfo.rebindGeneration(payload, currentGeneration);
+        publishToSelection(trackKey, currentGeneration, payload, selection, reason);
     }
 
-    private static StockLyricInfo.TrackSnapshot snapshotCurrent(String trackKey, long generation) {
-        synchronized (STATE_LOCK) {
-            if (!isCurrent(trackKey, generation)) return null;
+    private StockLyricInfo.TrackSnapshot snapshotCurrent(String trackKey, long currentGeneration) {
+        synchronized (stateLock) {
+            if (!isCurrent(trackKey, currentGeneration)) return null;
             return currentTrack;
         }
     }
 
-    private static void publish(String trackKey, long generation, String payload, String reason) {
-        if (!isCurrent(trackKey, generation) || isCommitted(trackKey, generation)) return;
-        SpotifySessionRegistry.Selection selection = REGISTRY.select(trackKey);
+    private void publish(String trackKey, long currentGeneration, String payload, String reason) {
+        if (!isCurrent(trackKey, currentGeneration) || isCommitted(trackKey, currentGeneration)) return;
+        SpotifySessionRegistry.Selection selection = registry.select(trackKey);
         if (selection == null) {
-            log("publish pending; no unique main session: " + REGISTRY.describe());
+            info("publish pending; no unique main session: " + registry.describe());
             return;
         }
-        publishToSelection(trackKey, generation, payload, selection, reason);
+        publishToSelection(trackKey, currentGeneration, payload, selection, reason);
     }
 
-    private static void publishToSelection(String trackKey, long generation, String payload,
-                                           SpotifySessionRegistry.Selection selection, String reason) {
-        if (!isCurrent(trackKey, generation) || isCommitted(trackKey, generation)) return;
+    private void publishToSelection(
+            String trackKey,
+            long currentGeneration,
+            String payload,
+            SpotifySessionRegistry.Selection selection,
+            String reason) {
+        if (!isCurrent(trackKey, currentGeneration) || isCommitted(trackKey, currentGeneration)) return;
         if (selection == null || selection.session == null || selection.metadata == null) return;
         if (SpotifySessionRegistry.isCastTag(selection.tag)) return;
         if (selection.track.hasSpotifyTrackId() && !trackKey.equals(selection.track.key())) return;
@@ -368,42 +647,42 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
             MediaMetadata patched = StockLyricInfo.withLyricInfo(selection.metadata, payload);
             int parcelBytes = StockLyricInfo.parcelSize(patched);
             if (parcelBytes <= 0) {
-                log("publish rejected; parcel measurement failed");
+                info("publish rejected; parcel measurement failed");
                 return;
             }
             if (parcelBytes > StockLyricInfo.MAX_PARCEL_BYTES) {
-                log("publish rejected; parcel too large=" + parcelBytes);
+                info("publish rejected; parcel too large=" + parcelBytes);
                 return;
             }
 
-            MODULE_WRITE.set(Boolean.TRUE);
+            moduleWrite.set(Boolean.TRUE);
             selection.session.setMetadata(patched);
-            REGISTRY.onHostMetadata(selection.session, patched);
-            markCommitted(trackKey, generation);
-            log("official Spotify lyricInfo committed once: " + shortId(trackKey)
+            registry.onHostMetadata(selection.session, patched);
+            markCommitted(trackKey, currentGeneration);
+            info("official Spotify lyricInfo committed once: " + shortId(trackKey)
                     + " reason=" + reason
                     + " tag=" + selection.tag
                     + " active=" + selection.active
                     + " state=" + selection.playbackState
                     + " parcel=" + parcelBytes);
         } catch (Throwable error) {
-            log("publish failed: " + error.getClass().getSimpleName() + ": " + error.getMessage());
+            info("publish failed: " + error.getClass().getSimpleName() + ": " + error.getMessage());
         } finally {
-            MODULE_WRITE.remove();
+            moduleWrite.remove();
         }
     }
 
-    private static boolean isCurrent(String trackKey, long generation) {
-        return generation == GENERATION.get() && trackKey.equals(currentTrackKey);
+    private boolean isCurrent(String trackKey, long currentGeneration) {
+        return currentGeneration == generation.get() && trackKey.equals(currentTrackKey);
     }
 
-    private static boolean isCommitted(String trackKey, long generation) {
-        return generation == committedGeneration && trackKey.equals(committedTrackKey);
+    private boolean isCommitted(String trackKey, long currentGeneration) {
+        return currentGeneration == committedGeneration && trackKey.equals(committedTrackKey);
     }
 
-    private static void markCommitted(String trackKey, long generation) {
+    private void markCommitted(String trackKey, long currentGeneration) {
         committedTrackKey = trackKey;
-        committedGeneration = generation;
+        committedGeneration = currentGeneration;
     }
 
     private static String safeLyricInfo(MediaMetadata metadata) {
@@ -421,9 +700,9 @@ public final class SpotifyHookEntry implements IXposedHookLoadPackage {
         return id.length() <= 8 ? id : id.substring(0, 8);
     }
 
-    private static void log(String message) {
+    private void info(String message) {
         Log.i(TAG, message);
-        XposedBridge.log("[ColorLyric] " + message);
+        log(Log.INFO, TAG, message);
     }
 
     private static final class Observation {
