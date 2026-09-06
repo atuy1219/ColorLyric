@@ -7,6 +7,7 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -19,8 +20,41 @@ import java.util.stream.Collectors;
 final class SpotifyColorLyricsClient {
     private static final String BASE_URL =
             "https://guc3-spclient.spotify.com/color-lyrics/v2/track/";
+    private static final int CONNECT_TIMEOUT_MS = 8_000;
+    private static final int READ_TIMEOUT_MS = 8_000;
 
     private SpotifyColorLyricsClient() {}
+
+    static final class FetchCall {
+        private volatile HttpURLConnection connection;
+        private volatile boolean cancelled;
+
+        void bind(HttpURLConnection value) throws InterruptedIOException {
+            if (cancelled) {
+                value.disconnect();
+                throw new InterruptedIOException("cancelled");
+            }
+            connection = value;
+            if (cancelled) {
+                value.disconnect();
+                throw new InterruptedIOException("cancelled");
+            }
+        }
+
+        void clear(HttpURLConnection value) {
+            if (connection == value) connection = null;
+        }
+
+        void cancel() {
+            cancelled = true;
+            HttpURLConnection active = connection;
+            if (active != null) active.disconnect();
+        }
+
+        boolean isCancelled() {
+            return cancelled;
+        }
+    }
 
     static final class Result {
         final String lineLyric;
@@ -46,10 +80,13 @@ final class SpotifyColorLyricsClient {
         }
     }
 
-    static Result fetch(StockLyricInfo.TrackSnapshot track, Map<String, String> headers)
-            throws Exception {
+    static Result fetch(
+            StockLyricInfo.TrackSnapshot track,
+            Map<String, String> headers,
+            FetchCall call) throws Exception {
         if (track == null || !track.hasSpotifyTrackId()) return Result.miss("invalid-track");
         if (headers == null || headers.isEmpty()) return Result.miss("headers-missing");
+        if (call != null && call.isCancelled()) return Result.miss("cancelled");
 
         String rawId = track.mediaId.substring("spotify:track:".length());
         String language = Locale.getDefault().toLanguageTag();
@@ -57,41 +94,55 @@ final class SpotifyColorLyricsClient {
                 + "?vocalRemoval=false&clientLanguage=" + language
                 + "&preview=false";
 
-        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-        connection.setConnectTimeout(15_000);
-        connection.setReadTimeout(15_000);
-        connection.setRequestMethod("GET");
-        connection.setRequestProperty("accept", "application/json");
-        connection.setRequestProperty("app-platform", "WebPlayer");
-        for (Map.Entry<String, String> entry : headers.entrySet()) {
-            if (entry.getKey() == null || entry.getValue() == null || entry.getValue().isBlank()) continue;
-            connection.setRequestProperty(entry.getKey(), entry.getValue());
-        }
-
-        int code = connection.getResponseCode();
-        InputStream stream = code >= 200 && code < 400
-                ? connection.getInputStream()
-                : connection.getErrorStream();
-        String body = "";
-        if (stream != null) {
-            try (InputStream input = stream;
-                 BufferedReader reader = new BufferedReader(
-                         new InputStreamReader(input, StandardCharsets.UTF_8))) {
-                body = reader.lines().collect(Collectors.joining("\n"));
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection) new URL(url).openConnection();
+            if (call != null) call.bind(connection);
+            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            connection.setReadTimeout(READ_TIMEOUT_MS);
+            connection.setRequestMethod("GET");
+            connection.setRequestProperty("accept", "application/json");
+            connection.setRequestProperty("app-platform", "WebPlayer");
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                if (entry.getKey() == null || entry.getValue() == null || entry.getValue().isBlank()) continue;
+                connection.setRequestProperty(entry.getKey(), entry.getValue());
             }
+
+            if (call != null && call.isCancelled()) return Result.miss("cancelled");
+            int code = connection.getResponseCode();
+            if (call != null && call.isCancelled()) return Result.miss("cancelled");
+
+            InputStream stream = code >= 200 && code < 400
+                    ? connection.getInputStream()
+                    : connection.getErrorStream();
+            String body = "";
+            if (stream != null) {
+                try (InputStream input = stream;
+                     BufferedReader reader = new BufferedReader(
+                             new InputStreamReader(input, StandardCharsets.UTF_8))) {
+                    body = reader.lines().collect(Collectors.joining("\n"));
+                }
+            }
+
+            if (code == 401) return Result.miss("http-401");
+            if (code == 403) return Result.miss("http-403");
+            if (code == 404) return Result.miss("http-404");
+            if (code == 429) return Result.miss("http-429");
+            if (code < 200 || code >= 300) return Result.miss("http-" + code);
+            if (body.isBlank()) return Result.miss("empty-body");
+            if (call != null && call.isCancelled()) return Result.miss("cancelled");
+
+            return decode(body);
+        } catch (InterruptedIOException error) {
+            if (call != null && call.isCancelled()) return Result.miss("cancelled");
+            throw error;
+        } finally {
+            if (call != null && connection != null) call.clear(connection);
+            if (connection != null) connection.disconnect();
         }
-        connection.disconnect();
-
-        if (code == 401) return Result.miss("http-401");
-        if (code == 403) return Result.miss("http-403");
-        if (code == 404) return Result.miss("http-404");
-        if (code < 200 || code >= 300) return Result.miss("http-" + code);
-        if (body.isBlank()) return Result.miss("empty-body");
-
-        return decode(body);
     }
 
-    private static Result decode(String body) {
+    static Result decode(String body) {
         try {
             JSONObject root = new JSONObject(body);
             JSONObject lyrics = root.optJSONObject("lyrics");
