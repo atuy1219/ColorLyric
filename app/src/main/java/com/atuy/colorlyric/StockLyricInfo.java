@@ -27,22 +27,38 @@ final class StockLyricInfo {
     static String build(TrackSnapshot track, String lyric, long generation) {
         if (track == null || lyric == null || lyric.isBlank()) return null;
         try {
+            String timedLyric = decorateLrc(track, lyric);
             JSONObject out = new JSONObject();
             out.put("songName", track.title);
             out.put("artist", track.artist);
             out.put("songId", track.mediaId);
             out.put("lyricType", 0);
             out.put("id", "");
-            out.put("lyric", lyric);
+            out.put("lyric", timedLyric);
             out.put("noLyric", false);
             out.put("provider", "com.spotify.music");
             out.put("source", "com.spotify.music-v5");
             out.put("trackKey", track.stableKey());
             out.put("sessionGeneration", generation);
+            out.put("rawLyric", timedLyric);
             return out.toString();
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    private static String decorateLrc(TrackSnapshot track, String lyric) {
+        String normalized = lyric.replace("\r\n", "\n").replace('\r', '\n');
+        StringBuilder out = new StringBuilder(normalized.length() + 96);
+        if (!track.title.isBlank()) out.append("[ti:").append(cleanTag(track.title)).append("]\n");
+        if (!track.artist.isBlank()) out.append("[ar:").append(cleanTag(track.artist)).append("]\n");
+        out.append(normalized);
+        if (!normalized.endsWith("\n")) out.append('\n');
+        return out.toString();
+    }
+
+    private static String cleanTag(String value) {
+        return value == null ? "" : value.replace('\r', ' ').replace('\n', ' ').trim();
     }
 
     static MediaMetadata withLyricInfo(MediaMetadata metadata, String value) {
