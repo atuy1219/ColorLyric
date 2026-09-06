@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <issue id="WrongConstant">
+        <ignore path="src/main/java/com/atuy/colorlyric/SpotifyHookEntry.java" />
+        <ignore path="src/main/java/com/atuy/colorlyric/StockLyricInfo.java" />
+    </issue>
+</lint>
