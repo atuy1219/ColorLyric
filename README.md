@@ -1,7 +1,14 @@
 # ColorLyric
 
-ColorLyric is a Spotify-only Xposed module for ColorOS/OxygenOS native lyrics.
-It hooks `com.spotify.music` only. `com.android.systemui` is not in scope.
+ColorLyric is an Xposed module for Spotify lyrics on ColorOS/OxygenOS.
+
+## Scope
+
+- `com.spotify.music`
+- `com.android.systemui`
+
+The SystemUI hook is intentionally minimal. It does **not** modify lyric parsing, rendering,
+`LyricsRecyclerView`, notifications, media artwork or the stock immersive lyric UI.
 
 ## Data flow
 
@@ -17,13 +24,32 @@ LINE_SYNCED / SYLLABLE_SYNCED decoder
 Spotify MediaSession / MediaMetadata["lyricInfo"]
         ↓
 ColorOS / OxygenOS SystemUI
+        ↓
+stock Live Alert / lock-screen lyric UI
 ```
 
-LRCLIB is no longer used.
+LRCLIB is not used.
+
+## Lock-screen policy
+
+On the tested OPlus ROM, Spotify lyrics already reach the stock `LyricsRecyclerView`, but OPlus
+returns a disabled lyric package policy for `com.spotify.music` while QQ Music is enabled.
+
+ColorLyric therefore hooks only the OPlus package-policy methods:
+
+- `getLyricEntrance(String)`
+- `getLyricEnable(String)` when present
+
+For Spotify lookups only, the package argument is evaluated as `com.tencent.qqmusic`. No numeric
+policy value such as `52` is hard-coded; the ROM's current QQ Music value is reused.
+
+The implementation first tries the known OPlus media action selector class. If the class name differs,
+it temporarily watches OPlus media class loading and hooks a class exposing the exact policy method
+shape. The watcher is removed after both policy methods are found.
 
 ## Spotify lyric source
 
-ColorLyric captures only the header names required by Spotify's own Color Lyrics request path:
+ColorLyric captures the headers needed by Spotify's Color Lyrics request path:
 
 - `authorization`
 - `client-token`
@@ -32,65 +58,21 @@ ColorLyric captures only the header names required by Spotify's own Color Lyrics
 
 Header values are never written to ColorLyric logs.
 
-Lyrics are requested from Spotify's Color Lyrics endpoint using the current `spotify:track:` ID.
-This keeps the lyric timeline aligned with Spotify's own playback asset instead of relying on a
-third-party LRC database.
+The current `spotify:track:` ID is requested from Spotify Color Lyrics. This keeps lyric timing aligned
+with Spotify playback instead of a third-party LRC database.
 
-ColorLyric supports:
+Supported timing:
 
-- `LINE_SYNCED` line timing;
-- `SYLLABLE_SYNCED` word/syllable timing when Spotify supplies syllable spans;
-- one publication per track generation;
-- replay only when Spotify itself replaces metadata and drops `lyricInfo`;
-- non-Cast active MediaSession selection;
-- stale-result rejection across rapid track changes.
-
-## ColorOS metadata
-
-The module publishes a standard ColorOS-compatible `lyricInfo` payload containing at least:
-
-```json
-{
-  "songName": "...",
-  "artist": "...",
-  "songId": "spotify:track:...",
-  "lyricType": 0,
-  "lyric": "[00:01.000]...",
-  "rawLyric": "[00:01.000]<00:01.000>...",
-  "noLyric": false
-}
-```
-
-For OPlus/QQ Music compatibility, the same MediaMetadata also receives:
-
-- `android.media.metadata.LYRIC`
-- `ratingUri` pointing back to the Spotify track
-- `transLyric` / `txtLyric` empty compatibility fields
-
-No second MediaSession is created.
-
-## Lock-screen behavior
-
-The player side now publishes all stock lyric data required by ColorOS and also adds the QQ Music
-style compatibility metadata above.
-
-Some OPlus SystemUI builds still apply a package-specific lyric-entrance policy. On such builds the
-lyrics can already reach the stock `LyricsRecyclerView` while the immersive lock-screen lyric page
-remains disabled for `com.spotify.music` (`lyricUiMode=false`). That final package gate lives in
-SystemUI and cannot be overridden from a Spotify-only Xposed scope.
-
-ColorLyric itself deliberately does **not** hook `com.android.systemui`. If the ROM blocks the lyric
-entrance by package, a SystemUI compatibility layer such as ColorOS Live Lyrics Bridge is required
-for that ROM. The Spotify lyric publication remains owned by ColorLyric.
+- `LINE_SYNCED`
+- `SYLLABLE_SYNCED`
 
 ## Installation
 
 1. Install ColorLyric.
-2. In LSPosed, enable only `com.spotify.music` for ColorLyric.
-3. Do not add `com.android.systemui` to ColorLyric's scope.
-4. Disable the separate Spotify Lyric Provider when testing ColorLyric standalone.
-5. Force-stop Spotify and start it again.
-6. Play a normal `spotify:track:` item.
+2. In LSPosed, enable both `com.spotify.music` and `com.android.systemui`.
+3. Disable the separate Spotify Lyric Provider when testing ColorLyric standalone.
+4. Reboot the device.
+5. Start Spotify and play a normal `spotify:track:` item.
 
 Debug:
 
@@ -98,27 +80,28 @@ Debug:
 adb logcat -s ColorLyric
 ```
 
-Expected bootstrap/fetch sequence:
+Expected SystemUI lines include:
 
 ```text
-loaded in Spotify main process; SystemUI not hooked
-header container hook=p.ot10
-addHeader hook=p.aj81 methods=...
+SystemUI minimal lyric-policy hook loading
+hooked ...#getLyricEntrance
+hooked ...#getLyricEnable
+policy alias getLyricEntrance: Spotify -> QQ Music
+policy alias getLyricEnable: Spotify -> QQ Music
+```
+
+Expected Spotify lines include:
+
+```text
 Spotify auth headers ready keys=authorization,client-token,user-agent,x-client-id
-track=........ generation=1 ...
 Spotify Color Lyrics outcome=ok syncType=LINE_SYNCED ...
 official Spotify lyricInfo committed once: ........
 ```
 
-The exact obfuscated Spotify header classes can change between Spotify versions. The current
-implementation also tries the non-obfuscated OkHttp/Cronet class names and logs which hooks were
-installed.
-
 ## Research notes
 
-The QQ Music Android implementation was inspected to determine the stock OPlus metadata contract.
-The public ColorOS Live Lyrics Providers Spotify implementation was consulted for architecture and
-compatibility research. ColorLyric's Java hook/client implementation is maintained in this repository.
+QQ Music's stock OPlus metadata behavior and ColorOS Live Lyrics Bridge / Providers were consulted for
+compatibility research. ColorLyric remains GPL-3.0-only.
 
 ## License
 
