@@ -1,74 +1,61 @@
-# ColorLyric 0.4 - Native Unlocker
+# ColorLyric 0.5 - Spotify Hook
 
-ColorLyric is a focused libxposed module for OPlus SystemUI. It does **not** draw a custom lyric
-view and does **not** create a Live Update notification. Its purpose is to let Spotify, after a
-separate Provider has published `MediaMetadata["lyricInfo"]`, enter the same stock lock-screen lyric
-page that QQ Music uses on supported ColorOS/OxygenOS builds.
+ColorLyric is an experimental Xposed module for ColorOS/OxygenOS lock-screen lyrics.
 
-## Data flow
+This branch **does not hook `com.android.systemui`**. It hooks only Spotify (`com.spotify.music`) and augments Spotify's own MediaSession metadata to more closely match the ColorOS/OPlus metadata emitted by QQ Music.
+
+## Why this version exists
+
+QQ Music's ColorOS path was reverse-engineered from an official QQ Music APK. On OPlus API 37+ its `addDataForOplusSeedling` path adds two relevant metadata entries to the player's MediaSession:
+
+- `lyricInfo`
+- `ratingUri`
+
+QQ Music's `action_lyric` PlaybackState custom action is only emitted on the HyperOS branch, so ColorLyric intentionally does **not** add that action on ColorOS/OxygenOS.
+
+## Current experiment
+
+For now, keep **Spotify Lyric Provider** enabled for Spotify. It supplies the timed `lyricInfo`. ColorLyric then, inside the Spotify process:
+
+1. observes Spotify `MediaSession#setMetadata`;
+2. waits until `lyricInfo` is present;
+3. normalizes several QQ-compatible fields (`id`, `lyricType`, `noLyric`, `transLyric`, `txtLyric`);
+4. adds `ratingUri` when Spotify does not already provide it;
+5. republishes the metadata through the same Spotify-owned MediaSession when necessary.
+
+This deliberately isolates the remaining native-UI compatibility difference before duplicating the provider's lyric-fetching stack.
+
+## LSPosed scope
+
+Select **only**:
 
 ```text
-Spotify
-  -> ColorOS Live Lyrics Spotify Provider
-  -> Spotify MediaSession["lyricInfo"]
-  -> OPlus SystemUI native lyric loader
-  -> ColorLyric native-gate compatibility
-  -> stock LyricsRecyclerView / immersive lock-screen lyric page
+com.spotify.music
 ```
 
-## What this build changes
+Do not select SystemUI.
 
-Only `com.android.systemui` is hooked.
+After changing the scope, force-stop Spotify or reboot.
 
-For `com.spotify.music`:
-
-- `getLyricEntrance(packageName)` is evaluated with QQ Music's package identity and the returned
-  vendor value is reused for Spotify. No numeric vendor constant is guessed.
-- `getLyricEnable(packageName)` is handled the same way when that method exists.
-- Spotify is appended to the OPlus media RUS whitelist getter when necessary.
-- The native `lyricInfo` loader is observed to confirm that SystemUI receives the Spotify payload.
-- Seedling `mediaDataToBundle(...)` keeps `shouldShowLyric=true` for a Spotify item that has lyric
-  state.
-
-The module intentionally does not replace media actions globally and does not alias Spotify to QQ
-Music outside these lyric-specific gates.
-
-## Installation
-
-1. Install and enable the Spotify Provider that publishes `lyricInfo` in `com.spotify.music`.
-2. Install ColorLyric.
-3. Enable only `com.android.systemui` in the ColorLyric LSPosed scope.
-4. Restart SystemUI or reboot.
-5. Start Spotify and play a track with lyrics.
-6. On the lock-screen media card, check for the native lyric-page entrance icon.
-
-Debug:
+## Debug
 
 ```sh
 adb logcat -s ColorLyric
 ```
 
-Useful events include:
+Expected messages:
 
 ```text
-Resolved OPlus media gates with DexKit
-Added Spotify to ... whitelist
-Native gate lyricEntrance: Spotify -> QQ Music policy, value=...
-Native gate lyricEnable: Spotify -> QQ Music policy, value=...
-Spotify native lyric loader: lyricInfo=present
-Seedling Spotify: shouldShowLyric ... -> true
+Loaded in Spotify process; SystemUI scope is not used
+Hooked android.media.session.MediaSession#setMetadata in Spotify only
+Normalized incoming Spotify metadata: lyricInfo + QQ/OPlus compatibility fields
+Replayed Spotify MediaSession metadata after lyricInfo became available
 ```
 
-## Compatibility
+## Credits
 
-The OPlus lock-screen lyric page is a private SystemUI feature. This build resolves current
-ColorOS/OxygenOS targets using the same stable string anchors documented by ColorOS Live Lyrics
-Bridge, with legacy class-name fallbacks. A SystemUI update can still require renewed adaptation.
+The Spotify MediaSession/`lyricInfo` architecture was studied using `io.github.andrealtb.coloroslyrics.provider.spotify` from **ColorOS Live Lyrics Providers** by Andrea-lyz/Andrea-TB. ColorLyric's implementation in this repository is independent and focused on the QQ Music/OPlus metadata delta rather than copying the Provider implementation.
 
-## Credits and license
+## License
 
-Apache-2.0.
-
-OPlus SystemUI target discovery and compatibility research is derived from and informed by
-**ColorOS Live Lyrics Bridge** by Andrea-lyz / Yunzhe Liao, also licensed under Apache-2.0.
-See `NOTICE`.
+GNU General Public License v3.0 (`GPL-3.0-only`).
