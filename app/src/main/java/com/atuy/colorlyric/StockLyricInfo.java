@@ -20,7 +20,15 @@ final class StockLyricInfo {
         if (value == null || value.isBlank()) return null;
         try {
             JSONObject source = new JSONObject(value);
-            return source.optString("lyric", "").isBlank() ? null : value;
+            if (source.optString("lyric", "").isBlank()) return null;
+
+            String songId = source.optString("songId", "").trim();
+            if (track != null && track.hasSpotifyTrackId()
+                    && songId.startsWith("spotify:track:")
+                    && !track.mediaId.equals(songId)) {
+                return null;
+            }
+            return value;
         } catch (Throwable ignored) {
             return null;
         }
