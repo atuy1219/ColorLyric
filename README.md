@@ -78,9 +78,17 @@ Supported timing:
 - `LINE_SYNCED`
 - `SYLLABLE_SYNCED`
 
-For Spotify update tolerance, ColorLyric tries the currently known header classes first and falls back
-to a temporary structural class-load discovery path. The fallback identifies the shaded immutable
-header container by class structure rather than its R8 `p.*` name, then removes the watcher.
+For Spotify update tolerance, ColorLyric no longer relies on Spotify's R8 `p.*` names as its
+primary mechanism. Network discovery starts during `onPackageLoaded`, before `onPackageReady`,
+and watches classes by structure. When a concrete Cronet engine appears, ColorLyric hooks
+`newUrlRequestBuilder(...)`, then hooks the actual builder instance returned at runtime to capture
+the required auth headers. Known obfuscated class names are retained only as startup hints.
+
+ColorLyric also observes Spotify's own Color Lyrics request URL. A Spotify HTTPS
+`/color-lyrics/.../track/` URL is converted into a track-ID template while preserving the host,
+API version and query string. The learned template is preferred for later fetches, with the built-in
+v3/v2 endpoints retained only as fallbacks. A newly learned endpoint revision invalidates old negative
+fetch-cache entries, so a Spotify endpoint migration can recover within the same app session.
 
 ## Fetch lifecycle
 
@@ -130,7 +138,10 @@ Expected Spotify lines include:
 
 ```text
 loaded in Spotify main process; API=102
+Spotify update-resilient network discovery loaded; API=102
+runtime Cronet builder=... writers=1
 Spotify auth headers ready keys=authorization,client-token,user-agent,x-client-id
+learned Spotify Color Lyrics endpoint revision=...
 Spotify Color Lyrics outcome=ok syncType=LINE_SYNCED ...
 official Spotify lyricInfo committed once: ........
 ```

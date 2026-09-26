@@ -526,12 +526,15 @@ public final class SpotifyHookEntry extends XposedModule {
             return;
         }
 
+        long endpointRevision = SpotifyEndpointStore.revision();
+        String endpointKey = trackKey + "|endpoint=" + endpointRevision;
         long now = System.currentTimeMillis();
-        Long negativeUntil = negativeCache.get(trackKey);
+        Long negativeUntil = negativeCache.get(endpointKey);
         if (SpotifyFetchPolicy.isNegativeCached(negativeUntil, now)) return;
-        if (negativeUntil != null) negativeCache.remove(trackKey);
+        if (negativeUntil != null) negativeCache.remove(endpointKey);
 
-        String requestKey = SpotifyFetchPolicy.requestKey(trackKey, currentGeneration);
+        String requestKey = SpotifyFetchPolicy.requestKey(trackKey, currentGeneration)
+                + "|endpoint=" + endpointRevision;
         if (!inFlight.add(requestKey)) return;
 
         SpotifyColorLyricsClient.FetchCall call = new SpotifyColorLyricsClient.FetchCall();
@@ -567,7 +570,7 @@ public final class SpotifyHookEntry extends XposedModule {
 
                 long ttl = SpotifyFetchPolicy.negativeTtlMs(result.outcome);
                 if (ttl > 0L) {
-                    negativeCache.put(trackKey, System.currentTimeMillis() + ttl);
+                    negativeCache.put(endpointKey, System.currentTimeMillis() + ttl);
                     return;
                 }
                 if (!result.isSuccess()) return;
@@ -580,7 +583,7 @@ public final class SpotifyHookEntry extends XposedModule {
                         result.syncType,
                         result.source);
                 if (payload == null || !isCurrent(trackKey, currentGeneration)) return;
-                negativeCache.remove(trackKey);
+                negativeCache.remove(endpointKey);
                 cache.put(trackKey, payload);
                 publish(trackKey, currentGeneration, payload, "spotify-color-lyrics");
             } catch (Throwable error) {

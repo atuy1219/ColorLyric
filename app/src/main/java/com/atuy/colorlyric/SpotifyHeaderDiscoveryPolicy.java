@@ -69,6 +69,25 @@ final class SpotifyHeaderDiscoveryPolicy {
         return false;
     }
 
+
+    static boolean isCronetRequestBuilderFactory(Method method) {
+        if (method == null
+                || Modifier.isStatic(method.getModifiers())
+                || Modifier.isAbstract(method.getModifiers())
+                || !"newUrlRequestBuilder".equals(method.getName())
+                || method.getParameterCount() < 1) {
+            return false;
+        }
+        return method.getParameterTypes()[0] == String.class;
+    }
+
+    static boolean isCronetEngineSubtype(Class<?> type) {
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            if ("org.chromium.net.CronetEngine".equals(current.getName())) return true;
+        }
+        return false;
+    }
+
     static boolean isSpotifyNetworkNamespace(String className) {
         if (className == null) return false;
         return className.startsWith("p.")
