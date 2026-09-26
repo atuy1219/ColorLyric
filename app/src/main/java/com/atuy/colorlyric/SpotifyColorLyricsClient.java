@@ -90,33 +90,32 @@ final class SpotifyColorLyricsClient {
         if (headers == null || headers.isEmpty()) return Result.miss("headers-missing");
         if (call != null && call.isCancelled()) return Result.miss("cancelled");
 
-        // Spotify 9.1.84.2231 ships both v2 and v3 Color Lyrics services and the
-        // playback path can select v3. Prefer the current endpoint, but retain v2
-        // as a compatibility fallback for accounts/regions still served by it.
-        Result v3 = fetchEndpoint(track, headers, call, BASE_URL_V3);
-        if (v3.isSuccess() || !shouldFallbackToV2(v3)) return v3;
-        return fetchEndpoint(track, headers, call, BASE_URL_V2);
+        String rawId = track.mediaId.substring("spotify:track:".length());
+        String language = Locale.getDefault().toLanguageTag();
+        Result last = Result.miss("endpoint-unavailable");
+
+        for (String url : SpotifyEndpointStore.candidateUrls(rawId, language)) {
+            Result result = fetchUrl(headers, call, url);
+            if (result.isSuccess()) return result;
+            last = result;
+            if (!shouldTryAnotherEndpoint(result)) return result;
+        }
+        return last;
     }
 
-    private static boolean shouldFallbackToV2(Result result) {
+    private static boolean shouldTryAnotherEndpoint(Result result) {
         if (result == null || result.isSuccess()) return false;
         return !"cancelled".equals(result.outcome)
                 && !"http-401".equals(result.outcome)
                 && !"http-429".equals(result.outcome);
     }
 
-    private static Result fetchEndpoint(
-            StockLyricInfo.TrackSnapshot track,
+    private static Result fetchUrl(
             Map<String, String> headers,
             FetchCall call,
-            String baseUrl) throws Exception {
+            String url) throws Exception {
         if (call != null && call.isCancelled()) return Result.miss("cancelled");
-
-        String rawId = track.mediaId.substring("spotify:track:".length());
-        String language = Locale.getDefault().toLanguageTag();
-        String url = baseUrl + rawId
-                + "?vocalRemoval=false&clientLanguage=" + language
-                + "&preview=false";
+        if (url == null || url.isBlank()) return Result.miss("endpoint-missing");
 
         HttpURLConnection connection = null;
         try {
