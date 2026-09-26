@@ -55,13 +55,11 @@ final class SpotifyEndpointStore {
             urls.add(template.replace(TRACK_PLACEHOLDER, trackId));
         }
 
-        String encodedLanguage = URLEncoder.encode(
-                language == null ? "" : language,
-                StandardCharsets.UTF_8);
+        String safeLanguage = language == null ? "" : language;
         urls.add("https://guc3-spclient.spotify.com/color-lyrics/v3/track/" + trackId
-                + "?vocalRemoval=false&clientLanguage=" + encodedLanguage + "&preview=false");
+                + "?vocalRemoval=false&clientLanguage=" + safeLanguage + "&preview=false");
         urls.add("https://guc3-spclient.spotify.com/color-lyrics/v2/track/" + trackId
-                + "?vocalRemoval=false&clientLanguage=" + encodedLanguage + "&preview=false");
+                + "?vocalRemoval=false&clientLanguage=" + safeLanguage + "&preview=false");
         return new ArrayList<>(urls);
     }
 
