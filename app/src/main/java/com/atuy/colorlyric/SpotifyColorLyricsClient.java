@@ -144,7 +144,7 @@ final class SpotifyColorLyricsClient {
                 try (InputStream input = stream;
                      BufferedReader reader = new BufferedReader(
                              new InputStreamReader(input, StandardCharsets.UTF_8))) {
-                    body = reader.lines().collect(Collectors.joining("\\n"));
+                    body = reader.lines().collect(Collectors.joining("\n"));
                 }
             }
 
