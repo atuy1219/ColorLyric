@@ -22,31 +22,25 @@ import io.github.libxposed.api.XposedModuleInterface;
 /**
  * Compatibility layer for Spotify's frequently renamed networking classes.
  *
- * <p>The main Spotify hook intentionally owns lyric fetching and publication. This module only keeps
- * SpotifyHeaderStore fed across R8 name changes. When headers become ready after the current track
- * metadata was already published, it replays that metadata once so SpotifyHookEntry can immediately
- * start its normal fetch path.</p>
+ * <p>The primary path no longer depends on Spotify's R8 names. Discovery starts in
+ * onPackageLoaded, watches network classes by structure, hooks concrete CronetEngine
+ * request factories, then hooks the actual builder class returned at runtime. Legacy
+ * class names remain only as startup accelerators for already-known builds.</p>
  */
 public final class SpotifyHeaderCompatEntry extends XposedModule {
     private static final String TAG = "ColorLyric";
     private static final String SPOTIFY = "com.spotify.music";
 
-    private static final String[] HEADER_CONTAINER_FAST_PATHS = {
-            // Spotify 9.1.84.2231
-            "p.mn20",
-            // Spotify 9.1.82.2160
-            "p.ob20",
-            // Older Spotify build used by ColorLyric
+    private static final String[] LEGACY_HEADER_CONTAINER_HINTS = {
+            "p.mn20", // Spotify 9.1.84.2231
+            "p.ob20", // Spotify 9.1.82.2160
             "p.ot10",
             "okhttp3.Headers"
     };
 
-    private static final String[] ADD_HEADER_FAST_PATHS = {
-            // Spotify 9.1.84.2231 Cronet request builder
-            "p.tka1",
-            // Spotify 9.1.82.2160 Cronet request builder
-            "p.ns91",
-            // Older Spotify build used by ColorLyric
+    private static final String[] LEGACY_ADD_HEADER_HINTS = {
+            "p.tka1", // Spotify 9.1.84.2231
+            "p.ns91", // Spotify 9.1.82.2160
             "p.aj81",
             "org.chromium.net.UrlRequest$Builder"
     };
@@ -55,13 +49,16 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     private final ThreadLocal<Boolean> replayGuard = new ThreadLocal<>();
     private final Set<String> hookedContainerClasses = ConcurrentHashMap.newKeySet();
     private final Set<String> hookedHeaderMethods = ConcurrentHashMap.newKeySet();
+    private final Set<String> hookedCronetFactoryMethods = ConcurrentHashMap.newKeySet();
     private final Set<XposedInterface.HookHandle> watcherHandles =
             Collections.synchronizedSet(new HashSet<>());
 
     private volatile WeakReference<MediaSession> latestSession = new WeakReference<>(null);
     private volatile MediaMetadata latestMetadata;
-    private volatile boolean installed;
+    private volatile boolean metadataHookInstalled;
+    private volatile boolean packageReadyInstalled;
     private volatile boolean watcherInstalled;
+    private volatile boolean cronetFactoryHooked;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -69,44 +66,71 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             detach();
             return;
         }
-        info("Spotify header compatibility layer loaded; API=" + getApiVersion());
+        info("Spotify update-resilient network discovery loaded; API=" + getApiVersion());
+    }
+
+    @Override
+    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
+        if (!SPOTIFY.equals(param.getPackageName())) return;
+        synchronized (this) {
+            installMetadataReplayHook();
+            installClassLoadWatcher();
+            int stable = inspectStableCronetAnchors(param.getDefaultClassLoader());
+            info("early Spotify network discovery installed stableHooks=" + stable
+                    + " watcher=" + watcherInstalled);
+        }
     }
 
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        if (!SPOTIFY.equals(param.getPackageName()) || installed) return;
+        if (!SPOTIFY.equals(param.getPackageName()) || packageReadyInstalled) return;
         synchronized (this) {
-            if (installed) return;
-            installed = true;
+            if (packageReadyInstalled) return;
+            packageReadyInstalled = true;
 
             installMetadataReplayHook();
-            int fastPathHooks = installKnownFastPaths(param.getClassLoader());
-            if (!SpotifyHeaderStore.isReady()) installClassLoadWatcher();
+            ClassLoader loader = param.getClassLoader();
+            int stable = inspectStableCronetAnchors(loader);
+            int legacy = installLegacyHints(loader);
+            installClassLoadWatcher();
+            retireDiscoveryWatcherIfStable();
 
-            info("Spotify header compatibility hooks installed=" + fastPathHooks
+            info("Spotify network compatibility ready stableHooks=" + stable
+                    + " legacyHints=" + legacy
+                    + " cronetFactory=" + cronetFactoryHooked
                     + " structuralWatcher=" + watcherInstalled);
         }
     }
 
     private void installMetadataReplayHook() {
-        try {
-            Method method = MediaSession.class.getDeclaredMethod("setMetadata", MediaMetadata.class);
-            method.setAccessible(true);
-            hook(method)
-                    .setId("colorlyric-compat-metadata-replay")
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                    .intercept(chain -> {
-                        if (!Boolean.TRUE.equals(replayGuard.get())) {
-                            Object instance = chain.getThisObject();
-                            Object incoming = chain.getArg(0);
-                            if (instance instanceof MediaSession && incoming instanceof MediaMetadata) {
-                                rememberTrackMetadata((MediaSession) instance, (MediaMetadata) incoming);
+        if (metadataHookInstalled) return;
+        synchronized (this) {
+            if (metadataHookInstalled) return;
+            try {
+                Method method = MediaSession.class.getDeclaredMethod(
+                        "setMetadata", MediaMetadata.class);
+                method.setAccessible(true);
+                hook(method)
+                        .setId("colorlyric-compat-metadata-replay")
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            if (!Boolean.TRUE.equals(replayGuard.get())) {
+                                Object instance = chain.getThisObject();
+                                Object incoming = chain.getArg(0);
+                                if (instance instanceof MediaSession
+                                        && incoming instanceof MediaMetadata) {
+                                    rememberTrackMetadata(
+                                            (MediaSession) instance,
+                                            (MediaMetadata) incoming);
+                                }
                             }
-                        }
-                        return chain.proceed();
-                    });
-        } catch (Throwable error) {
-            info("compat metadata hook unavailable: " + error.getClass().getSimpleName());
+                            return chain.proceed();
+                        });
+                metadataHookInstalled = true;
+            } catch (Throwable error) {
+                info("compat metadata hook unavailable: "
+                        + error.getClass().getSimpleName());
+            }
         }
     }
 
@@ -122,33 +146,45 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         latestMetadata = metadata;
     }
 
-    private int installKnownFastPaths(ClassLoader classLoader) {
-        int installedCount = 0;
-        for (String className : HEADER_CONTAINER_FAST_PATHS) {
-            installedCount += hookKnownHeaderContainer(classLoader, className);
-        }
-        for (String className : ADD_HEADER_FAST_PATHS) {
-            installedCount += hookKnownAddHeader(classLoader, className);
-        }
-        return installedCount;
+    private int inspectStableCronetAnchors(ClassLoader classLoader) {
+        int installed = 0;
+        installed += inspectKnownClass(classLoader, "org.chromium.net.CronetEngine");
+        installed += inspectKnownClass(classLoader, "org.chromium.net.ExperimentalCronetEngine");
+        installed += inspectKnownClass(classLoader, "org.chromium.net.UrlRequest$Builder");
+        return installed;
     }
 
-    private int hookKnownHeaderContainer(ClassLoader classLoader, String className) {
+    private int installLegacyHints(ClassLoader classLoader) {
+        int installed = 0;
+        for (String className : LEGACY_HEADER_CONTAINER_HINTS) {
+            installed += inspectKnownClass(classLoader, className);
+        }
+        for (String className : LEGACY_ADD_HEADER_HINTS) {
+            installed += inspectKnownClass(classLoader, className);
+        }
+        return installed;
+    }
+
+    private int inspectKnownClass(ClassLoader classLoader, String className) {
         try {
-            Class<?> type = Class.forName(className, false, classLoader);
-            return hookHeaderContainer(type);
+            return inspectNetworkType(Class.forName(className, false, classLoader));
         } catch (Throwable ignored) {
             return 0;
         }
     }
 
-    private int hookKnownAddHeader(ClassLoader classLoader, String className) {
-        try {
-            Class<?> type = Class.forName(className, false, classLoader);
-            return hookAddHeaderMethods(type);
-        } catch (Throwable ignored) {
-            return 0;
+    private int inspectNetworkType(Class<?> type) {
+        if (type == null) return 0;
+        int containers = hookHeaderContainer(type);
+        int writers = hookAddHeaderMethods(type);
+        int factories = hookCronetFactoryMethods(type);
+        if (containers > 0 || writers > 0 || factories > 0) {
+            info("Spotify network target=" + type.getName()
+                    + " containers=" + containers
+                    + " writers=" + writers
+                    + " factories=" + factories);
         }
+        return containers + writers + factories;
     }
 
     private int hookHeaderContainer(Class<?> type) {
@@ -173,7 +209,8 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
                                 becameReady |= SpotifyHeaderStore.ingestPairs(arg);
                             }
                             becameReady |= captureStringArrayFields(chain.getThisObject());
-                            if (becameReady) onHeadersReady("container:" + type.getName());
+                            if (becameReady) onHeadersReady(
+                                    "container:" + type.getName());
                             return result;
                         });
                 count++;
@@ -183,12 +220,8 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             }
         }
 
-        if (count > 0) {
-            info("compat header container=" + type.getName() + " constructors=" + count);
-            return count;
-        }
-        hookedContainerClasses.remove(type.getName());
-        return 0;
+        if (count == 0) hookedContainerClasses.remove(type.getName());
+        return count;
     }
 
     private int hookAddHeaderMethods(Class<?> type) {
@@ -210,7 +243,9 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
                             String value = chain.getArg(1) instanceof String
                                     ? (String) chain.getArg(1) : null;
                             boolean becameReady = SpotifyHeaderStore.ingest(name, value);
-                            if (becameReady) onHeadersReady("addHeader:" + type.getName());
+                            if (becameReady) {
+                                onHeadersReady("addHeader:" + type.getName());
+                            }
                             return chain.proceed();
                         });
                 count++;
@@ -220,15 +255,63 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
                         + error.getClass().getSimpleName());
             }
         }
+        return count;
+    }
 
-        if (count > 0) info("compat addHeader=" + type.getName() + " methods=" + count);
+    private int hookCronetFactoryMethods(Class<?> type) {
+        if (!SpotifyHeaderDiscoveryPolicy.isCronetEngineSubtype(type)) return 0;
+
+        int count = 0;
+        for (Method method : type.getDeclaredMethods()) {
+            if (!SpotifyHeaderDiscoveryPolicy.isCronetRequestBuilderFactory(method)) continue;
+            String key = type.getName() + "#" + method.toGenericString();
+            if (!hookedCronetFactoryMethods.add(key)) continue;
+            try {
+                method.setAccessible(true);
+                hook(method)
+                        .setId("colorlyric-cronet-request-factory")
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            String url = chain.getArg(0) instanceof String
+                                    ? (String) chain.getArg(0) : null;
+                            Object builder = chain.proceed();
+
+                            if (builder != null) {
+                                int writers = hookAddHeaderMethods(builder.getClass());
+                                if (writers > 0) {
+                                    info("runtime Cronet builder="
+                                            + builder.getClass().getName()
+                                            + " writers=" + writers);
+                                }
+                            }
+
+                            if (SpotifyEndpointStore.observeUrl(url)) {
+                                info("learned Spotify Color Lyrics endpoint revision="
+                                        + SpotifyEndpointStore.revision());
+                                if (SpotifyHeaderStore.isReady()) replayLatestMetadata();
+                            }
+                            retireDiscoveryWatcherIfStable();
+                            return builder;
+                        });
+                count++;
+            } catch (Throwable error) {
+                hookedCronetFactoryMethods.remove(key);
+                info("Cronet factory hook failed " + type.getName() + ": "
+                        + error.getClass().getSimpleName());
+            }
+        }
+
+        if (count > 0) {
+            cronetFactoryHooked = true;
+            retireDiscoveryWatcherIfStable();
+        }
         return count;
     }
 
     private void installClassLoadWatcher() {
         if (watcherInstalled) return;
         synchronized (this) {
-            if (watcherInstalled || SpotifyHeaderStore.isReady()) return;
+            if (watcherInstalled) return;
             watcherInstalled = true;
 
             for (Method method : ClassLoader.class.getDeclaredMethods()) {
@@ -240,7 +323,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
                 try {
                     method.setAccessible(true);
                     XposedInterface.HookHandle handle = hook(method)
-                            .setId("colorlyric-compat-header-discovery")
+                            .setId("colorlyric-compat-network-discovery")
                             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                             .intercept(chain -> {
                                 Object result = chain.proceed();
@@ -255,14 +338,8 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
 
                                 discoveryGuard.set(Boolean.TRUE);
                                 try {
-                                    int containers = hookHeaderContainer(type);
-                                    int writers = hookAddHeaderMethods(type);
-                                    if (containers > 0 || writers > 0) {
-                                        info("structural Spotify header target=" + type.getName()
-                                                + " containers=" + containers
-                                                + " writers=" + writers);
-                                    }
-                                    if (SpotifyHeaderStore.isReady()) removeClassLoadWatcher();
+                                    inspectNetworkType(type);
+                                    retireDiscoveryWatcherIfStable();
                                 } finally {
                                     discoveryGuard.remove();
                                 }
@@ -270,7 +347,8 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
                             });
                     watcherHandles.add(handle);
                 } catch (Throwable error) {
-                    info("compat class watcher failed: " + error.getClass().getSimpleName());
+                    info("compat class watcher failed: "
+                            + error.getClass().getSimpleName());
                 }
             }
 
@@ -287,7 +365,10 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         if (object == null) return false;
         boolean becameReady = false;
         for (Field field : object.getClass().getDeclaredFields()) {
-            if (Modifier.isStatic(field.getModifiers()) || field.getType() != String[].class) continue;
+            if (Modifier.isStatic(field.getModifiers())
+                    || field.getType() != String[].class) {
+                continue;
+            }
             try {
                 field.setAccessible(true);
                 becameReady |= SpotifyHeaderStore.ingestPairs(field.get(object));
@@ -300,8 +381,8 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     private void onHeadersReady(String source) {
         info("Spotify auth headers recovered via " + source
                 + " keys=" + SpotifyHeaderStore.capturedKeys());
-        removeClassLoadWatcher();
         replayLatestMetadata();
+        retireDiscoveryWatcherIfStable();
     }
 
     private void replayLatestMetadata() {
@@ -318,18 +399,25 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         try {
             replayGuard.set(Boolean.TRUE);
             session.setMetadata(metadata);
-            info("replayed Spotify metadata after auth header recovery");
+            info("replayed Spotify metadata after network discovery update");
         } catch (Throwable error) {
-            info("compat metadata replay failed: " + error.getClass().getSimpleName());
+            info("compat metadata replay failed: "
+                    + error.getClass().getSimpleName());
         } finally {
             replayGuard.remove();
         }
     }
 
+    private void retireDiscoveryWatcherIfStable() {
+        if (!SpotifyHeaderStore.isReady() || !cronetFactoryHooked) return;
+        removeClassLoadWatcher();
+    }
+
     private void removeClassLoadWatcher() {
         synchronized (this) {
             if (watcherHandles.isEmpty()) return;
-            for (XposedInterface.HookHandle handle : new HashSet<>(watcherHandles)) {
+            for (XposedInterface.HookHandle handle :
+                    new HashSet<>(watcherHandles)) {
                 try {
                     handle.unhook();
                 } catch (Throwable ignored) {
