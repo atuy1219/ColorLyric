@@ -18,7 +18,9 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 final class SpotifyColorLyricsClient {
-    private static final String BASE_URL =
+    private static final String BASE_URL_V3 =
+            "https://guc3-spclient.spotify.com/color-lyrics/v3/track/";
+    private static final String BASE_URL_V2 =
             "https://guc3-spclient.spotify.com/color-lyrics/v2/track/";
     private static final int CONNECT_TIMEOUT_MS = 8_000;
     private static final int READ_TIMEOUT_MS = 8_000;
@@ -88,9 +90,31 @@ final class SpotifyColorLyricsClient {
         if (headers == null || headers.isEmpty()) return Result.miss("headers-missing");
         if (call != null && call.isCancelled()) return Result.miss("cancelled");
 
+        // Spotify 9.1.84.2231 ships both v2 and v3 Color Lyrics services and the
+        // playback path can select v3. Prefer the current endpoint, but retain v2
+        // as a compatibility fallback for accounts/regions still served by it.
+        Result v3 = fetchEndpoint(track, headers, call, BASE_URL_V3);
+        if (v3.isSuccess() || !shouldFallbackToV2(v3)) return v3;
+        return fetchEndpoint(track, headers, call, BASE_URL_V2);
+    }
+
+    private static boolean shouldFallbackToV2(Result result) {
+        if (result == null || result.isSuccess()) return false;
+        return !"cancelled".equals(result.outcome)
+                && !"http-401".equals(result.outcome)
+                && !"http-429".equals(result.outcome);
+    }
+
+    private static Result fetchEndpoint(
+            StockLyricInfo.TrackSnapshot track,
+            Map<String, String> headers,
+            FetchCall call,
+            String baseUrl) throws Exception {
+        if (call != null && call.isCancelled()) return Result.miss("cancelled");
+
         String rawId = track.mediaId.substring("spotify:track:".length());
         String language = Locale.getDefault().toLanguageTag();
-        String url = BASE_URL + rawId
+        String url = baseUrl + rawId
                 + "?vocalRemoval=false&clientLanguage=" + language
                 + "&preview=false";
 
@@ -120,7 +144,7 @@ final class SpotifyColorLyricsClient {
                 try (InputStream input = stream;
                      BufferedReader reader = new BufferedReader(
                              new InputStreamReader(input, StandardCharsets.UTF_8))) {
-                    body = reader.lines().collect(Collectors.joining("\n"));
+                    body = reader.lines().collect(Collectors.joining("\\n"));
                 }
             }
 
