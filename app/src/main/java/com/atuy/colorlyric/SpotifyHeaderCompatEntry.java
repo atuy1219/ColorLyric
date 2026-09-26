@@ -32,17 +32,21 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     private static final String SPOTIFY = "com.spotify.music";
 
     private static final String[] HEADER_CONTAINER_FAST_PATHS = {
+            // Spotify 9.1.84.2231
+            "p.mn20",
             // Spotify 9.1.82.2160
             "p.ob20",
-            // Previous Spotify build used by ColorLyric
+            // Older Spotify build used by ColorLyric
             "p.ot10",
             "okhttp3.Headers"
     };
 
     private static final String[] ADD_HEADER_FAST_PATHS = {
+            // Spotify 9.1.84.2231 Cronet request builder
+            "p.tka1",
             // Spotify 9.1.82.2160 Cronet request builder
             "p.ns91",
-            // Previous Spotify build used by ColorLyric
+            // Older Spotify build used by ColorLyric
             "p.aj81",
             "org.chromium.net.UrlRequest$Builder"
     };
