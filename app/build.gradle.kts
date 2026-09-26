@@ -10,8 +10,8 @@ android {
         applicationId = "com.atuy.colorlyric"
         minSdk = 31
         targetSdk = 36
-        versionCode = 13
-        versionName = "1.2.1-api102"
+        versionCode = 14
+        versionName = "1.2.2-api102"
     }
 
     buildTypes {
