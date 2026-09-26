@@ -37,6 +37,20 @@ public final class SpotifyHeaderDiscoveryPolicyTest {
     }
 
     @Test
+    public void recognizesCronetRequestBuilderFactoryShape() throws Exception {
+        Method valid = FakeCronetEngine.class.getDeclaredMethod(
+                "newUrlRequestBuilder", String.class, Object.class, Object.class);
+        Method wrongFirstArg = FakeCronetEngine.class.getDeclaredMethod(
+                "newUrlRequestBuilder", int.class);
+        Method abstractFactory = AbstractCronetEngine.class.getDeclaredMethod(
+                "newUrlRequestBuilder", String.class);
+
+        assertTrue(SpotifyHeaderDiscoveryPolicy.isCronetRequestBuilderFactory(valid));
+        assertFalse(SpotifyHeaderDiscoveryPolicy.isCronetRequestBuilderFactory(wrongFirstArg));
+        assertFalse(SpotifyHeaderDiscoveryPolicy.isCronetRequestBuilderFactory(abstractFactory));
+    }
+
+    @Test
     public void limitsRuntimeScanningToSpotifyNetworkNamespaces() {
         assertTrue(SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace("p.ob20"));
         assertTrue(SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace("com.spotify.net.Client"));
@@ -115,4 +129,19 @@ public final class SpotifyHeaderDiscoveryPolicyTest {
     private abstract static class AbstractBuilder {
         abstract AbstractBuilder addHeader(String name, String value);
     }
+
+    private static class FakeCronetEngine {
+        Object newUrlRequestBuilder(String url, Object callback, Object executor) {
+            return new Object();
+        }
+
+        Object newUrlRequestBuilder(int ignored) {
+            return new Object();
+        }
+    }
+
+    private abstract static class AbstractCronetEngine {
+        abstract Object newUrlRequestBuilder(String url);
+    }
 }
+
