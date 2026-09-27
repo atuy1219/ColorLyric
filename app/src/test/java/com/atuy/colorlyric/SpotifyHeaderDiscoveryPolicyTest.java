@@ -52,7 +52,7 @@ public final class SpotifyHeaderDiscoveryPolicyTest {
 
     @Test
     public void limitsRuntimeScanningToSpotifyNetworkNamespaces() {
-        assertTrue(SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace("p.ob20"));
+        assertTrue(SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace("p.synthetic"));
         assertTrue(SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace("com.spotify.net.Client"));
         assertTrue(SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace("okhttp3.Headers"));
         assertTrue(SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace(
