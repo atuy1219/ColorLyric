@@ -22,28 +22,13 @@ import io.github.libxposed.api.XposedModuleInterface;
 /**
  * Compatibility layer for Spotify's frequently renamed networking classes.
  *
- * <p>The primary path no longer depends on Spotify's R8 names. Discovery starts in
- * onPackageLoaded, watches network classes by structure, hooks concrete CronetEngine
- * request factories, then hooks the actual builder class returned at runtime. Legacy
- * class names remain only as startup accelerators for already-known builds.</p>
+ * <p>Discovery does not depend on Spotify's R8 class names. It starts in
+ * onPackageLoaded, watches network classes by structure, hooks stable Cronet APIs,
+ * then hooks the actual builder class returned at runtime.</p>
  */
 public final class SpotifyHeaderCompatEntry extends XposedModule {
     private static final String TAG = "ColorLyric";
     private static final String SPOTIFY = "com.spotify.music";
-
-    private static final String[] LEGACY_HEADER_CONTAINER_HINTS = {
-            "p.mn20", // Spotify 9.1.84.2231
-            "p.ob20", // Spotify 9.1.82.2160
-            "p.ot10",
-            "okhttp3.Headers"
-    };
-
-    private static final String[] LEGACY_ADD_HEADER_HINTS = {
-            "p.tka1", // Spotify 9.1.84.2231
-            "p.ns91", // Spotify 9.1.82.2160
-            "p.aj81",
-            "org.chromium.net.UrlRequest$Builder"
-    };
 
     private final ThreadLocal<Boolean> discoveryGuard = new ThreadLocal<>();
     private final ThreadLocal<Boolean> replayGuard = new ThreadLocal<>();
@@ -75,7 +60,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         synchronized (this) {
             installMetadataReplayHook();
             installClassLoadWatcher();
-            int stable = inspectStableCronetAnchors(param.getDefaultClassLoader());
+            int stable = inspectStableNetworkAnchors(param.getDefaultClassLoader());
             info("early Spotify network discovery installed stableHooks=" + stable
                     + " watcher=" + watcherInstalled);
         }
@@ -90,13 +75,11 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
 
             installMetadataReplayHook();
             ClassLoader loader = param.getClassLoader();
-            int stable = inspectStableCronetAnchors(loader);
-            int legacy = installLegacyHints(loader);
+            int stable = inspectStableNetworkAnchors(loader);
             installClassLoadWatcher();
             retireDiscoveryWatcherIfStable();
 
             info("Spotify network compatibility ready stableHooks=" + stable
-                    + " legacyHints=" + legacy
                     + " cronetFactory=" + cronetFactoryHooked
                     + " structuralWatcher=" + watcherInstalled);
         }
@@ -146,22 +129,12 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         latestMetadata = metadata;
     }
 
-    private int inspectStableCronetAnchors(ClassLoader classLoader) {
+    private int inspectStableNetworkAnchors(ClassLoader classLoader) {
         int installed = 0;
         installed += inspectKnownClass(classLoader, "org.chromium.net.CronetEngine");
         installed += inspectKnownClass(classLoader, "org.chromium.net.ExperimentalCronetEngine");
         installed += inspectKnownClass(classLoader, "org.chromium.net.UrlRequest$Builder");
-        return installed;
-    }
-
-    private int installLegacyHints(ClassLoader classLoader) {
-        int installed = 0;
-        for (String className : LEGACY_HEADER_CONTAINER_HINTS) {
-            installed += inspectKnownClass(classLoader, className);
-        }
-        for (String className : LEGACY_ADD_HEADER_HINTS) {
-            installed += inspectKnownClass(classLoader, className);
-        }
+        installed += inspectKnownClass(classLoader, "okhttp3.Headers");
         return installed;
     }
 

@@ -206,13 +206,7 @@ public final class SpotifyHookEntry extends XposedModule {
 
     private void installSpotifyHeaderHooks(ClassLoader classLoader) {
         int installed = 0;
-        installed += hookKnownHeaderContainer(classLoader, "p.mn20"); // Spotify 9.1.84.2231
-        installed += hookKnownHeaderContainer(classLoader, "p.ob20"); // Spotify 9.1.82.2160
-        installed += hookKnownHeaderContainer(classLoader, "p.ot10");
         installed += hookKnownHeaderContainer(classLoader, "okhttp3.Headers");
-        installed += hookAddHeader(classLoader, "p.tka1"); // Spotify 9.1.84.2231
-        installed += hookAddHeader(classLoader, "p.ns91"); // Spotify 9.1.82.2160
-        installed += hookAddHeader(classLoader, "p.aj81");
         installed += hookAddHeader(classLoader, "org.chromium.net.UrlRequest$Builder");
 
         if (!headerContainerHooked) {
