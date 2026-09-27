@@ -297,54 +297,12 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     }
 
     private void installClassLoadWatcher() {
-        if (watcherInstalled) return;
-        synchronized (this) {
-            if (watcherInstalled) return;
-            watcherInstalled = true;
-
-            installClassResolverWatcher(ClassLoader.class, "loadClass");
-            try {
-                Class<?> baseDex = Class.forName("dalvik.system.BaseDexClassLoader");
-                installClassResolverWatcher(baseDex, "findClass");
-            } catch (Throwable error) {
-                info("BaseDexClassLoader watcher unavailable: "
-                        + error.getClass().getSimpleName());
-            }
-
-            if (watcherHandles.isEmpty()) {
-                watcherInstalled = false;
-                info("compat structural class watcher unavailable");
-            } else {
-                info("compat structural class watcher installed handles="
-                        + watcherHandles.size());
-            }
-        }
-    }
-
-    private void installClassResolverWatcher(Class<?> owner, String methodName) {
-        for (Method method : owner.getDeclaredMethods()) {
-            if (!methodName.equals(method.getName())
-                    || method.getParameterCount() < 1
-                    || method.getParameterTypes()[0] != String.class
-                    || method.getReturnType() != Class.class) {
-                continue;
-            }
-            try {
-                method.setAccessible(true);
-                XposedInterface.HookHandle handle = hook(method)
-                        .setId("colorlyric-compat-network-discovery-" + methodName)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .intercept(chain -> {
-                            Object result = chain.proceed();
-                            if (result instanceof Class<?>) inspectResolvedType((Class<?>) result);
-                            return result;
-                        });
-                watcherHandles.add(handle);
-            } catch (Throwable error) {
-                info("compat " + owner.getSimpleName() + "." + methodName
-                        + " watcher failed: " + error.getClass().getSimpleName());
-            }
-        }
+        // Intentionally disabled. Hooking ClassLoader.loadClass/findClass is unsafe
+        // when multiple libxposed modules intercept class resolution: nested
+        // chain.proceed() calls can recurse before the resolved Class is returned.
+        // Discovery is instead driven by the live ClassLoader DexFile scan plus
+        // stable Cronet factory hooks, neither of which depends on Spotify R8 names.
+        watcherInstalled = false;
     }
 
     private void inspectResolvedType(Class<?> type) {
