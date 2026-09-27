@@ -35,10 +35,9 @@ public final class SystemUiPolicyHookEntry extends XposedModule {
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
-        if (!SYSTEMUI.equals(param.getProcessName())) {
-            detach();
-            return;
-        }
+        String process = param.getProcessName();
+        info("SystemUI policy callback process=" + process);
+        if (!SYSTEMUI.equals(process)) return;
         info("SystemUI minimal lyric-policy hook loading; API=" + getApiVersion());
     }
 
