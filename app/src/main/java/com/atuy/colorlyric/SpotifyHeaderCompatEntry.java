@@ -397,7 +397,9 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
 
             for (String apkPath : paths) {
                 if (apkPath == null || apkPath.isBlank()) continue;
-                try (DexFile dex = new DexFile(apkPath)) {
+                DexFile dex = null;
+                try {
+                    dex = new DexFile(apkPath);
                     dexCount++;
                     Enumeration<String> entries = dex.entries();
                     while (entries.hasMoreElements()) {
@@ -423,6 +425,13 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
                 } catch (Throwable error) {
                     info("Spotify DEX scan path failed: "
                             + error.getClass().getSimpleName());
+                } finally {
+                    if (dex != null) {
+                        try {
+                            dex.close();
+                        } catch (Throwable ignored) {
+                        }
+                    }
                 }
             }
         } catch (Throwable error) {
