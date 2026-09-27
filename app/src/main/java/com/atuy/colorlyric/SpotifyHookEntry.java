@@ -263,11 +263,13 @@ public final class SpotifyHookEntry extends XposedModule {
         installed += hookKnownHeaderContainer(classLoader, "okhttp3.Headers");
         installed += hookAddHeader(classLoader, "org.chromium.net.UrlRequest$Builder");
 
-        if (!headerContainerHooked) {
-            installHeaderClassLoadWatcher();
-        }
+        // Do not hook ClassLoader.loadClass here. Vector and other libxposed
+        // modules may also intercept class resolution, and nested chain.proceed()
+        // calls can recurse before any Spotify class is inspected. The companion
+        // compatibility entry performs a full live-Dex structural scan and hooks
+        // Cronet factories, which covers renamed networking implementations.
         info("Spotify auth header hooks installed=" + installed
-                + " structuralWatcher=" + headerWatcherInstalled);
+                + " classLoaderWatcher=false dexCompat=true");
     }
 
     private int hookKnownHeaderContainer(ClassLoader classLoader, String className) {
