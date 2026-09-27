@@ -8,6 +8,7 @@ import android.media.session.MediaSession;
 import android.util.Log;
 
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -49,7 +50,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     private volatile boolean packageReadyInstalled;
     private volatile boolean watcherInstalled;
     private volatile boolean cronetFactoryHooked;
-    private volatile boolean dexScanStarted;
+    private final Set<ClassLoader> scannedDexLoaders = ConcurrentHashMap.newKeySet();
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -72,7 +73,9 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         synchronized (this) {
             installMetadataReplayHook();
             installClassLoadWatcher();
-            int stable = inspectStableNetworkAnchors(param.getDefaultClassLoader());
+            ClassLoader loader = param.getDefaultClassLoader();
+            int stable = inspectStableNetworkAnchors(loader);
+            startDexStructureScan(loader, "package-loaded");
             info("early Spotify network discovery installed stableHooks=" + stable
                     + " watcher=" + watcherInstalled);
         }
@@ -89,7 +92,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             ClassLoader loader = param.getClassLoader();
             int stable = inspectStableNetworkAnchors(loader);
             installClassLoadWatcher();
-            startDexStructureScan(loader);
+            startDexStructureScan(loader, "package-ready");
             retireDiscoveryWatcherIfStable();
 
             info("Spotify network compatibility ready stableHooks=" + stable
@@ -358,96 +361,173 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         }
     }
 
-    private void startDexStructureScan(ClassLoader loader) {
-        if (dexScanStarted) return;
-        synchronized (this) {
-            if (dexScanStarted) return;
-            dexScanStarted = true;
-        }
+    private void startDexStructureScan(ClassLoader loader, String phase) {
+        if (loader == null || !scannedDexLoaders.add(loader)) return;
 
-        Thread thread = new Thread(() -> scanSpotifyDex(loader),
+        Thread thread = new Thread(() -> scanSpotifyDex(loader, phase),
                 "ColorLyric-SpotifyDexDiscovery");
         thread.setDaemon(true);
         thread.setPriority(Thread.MIN_PRIORITY);
         thread.start();
     }
 
-    private void scanSpotifyDex(ClassLoader loader) {
+    private void scanSpotifyDex(ClassLoader loader, String phase) {
         long started = System.currentTimeMillis();
-        int dexCount = 0;
-        int candidates = 0;
-        int loaded = 0;
-        int installed = 0;
+        ScanStats stats = new ScanStats();
+        Set<String> seenClasses = new HashSet<>();
 
         try {
+            // Prefer the DexFile objects already owned by Spotify's ClassLoader.
+            // A modern Spotify APK is multidex; walking these objects guarantees
+            // that secondary DEX files are considered without knowing R8 names.
+            Set<DexFile> liveDexFiles = collectClassLoaderDexFiles(loader);
+            for (DexFile dex : liveDexFiles) {
+                stats.dexCount++;
+                scanDexEntries(dex, loader, seenClasses, stats);
+            }
+
+            // Keep the APK-path scan as a fallback for runtimes that block
+            // reflective access to BaseDexClassLoader internals.
             Application application = currentApplication();
-            if (application == null) {
-                info("Spotify DEX structural scan skipped: application unavailable");
-                return;
-            }
+            if (application != null) {
+                ApplicationInfo appInfo = application.getApplicationInfo();
+                String[] splitDirs = appInfo.splitSourceDirs;
+                int totalPaths = 1 + (splitDirs == null ? 0 : splitDirs.length);
+                String[] paths = new String[totalPaths];
+                paths[0] = appInfo.sourceDir;
+                if (splitDirs != null) {
+                    System.arraycopy(splitDirs, 0, paths, 1, splitDirs.length);
+                }
 
-            ApplicationInfo appInfo = application.getApplicationInfo();
-            String[] splitDirs = appInfo.splitSourceDirs;
-            int totalPaths = 1 + (splitDirs == null ? 0 : splitDirs.length);
-            String[] paths = new String[totalPaths];
-            paths[0] = appInfo.sourceDir;
-            if (splitDirs != null) {
-                System.arraycopy(splitDirs, 0, paths, 1, splitDirs.length);
-            }
-
-            for (String apkPath : paths) {
-                if (apkPath == null || apkPath.isBlank()) continue;
-                DexFile dex = null;
-                try {
-                    dex = new DexFile(apkPath);
-                    dexCount++;
-                    Enumeration<String> entries = dex.entries();
-                    while (entries.hasMoreElements()) {
-                        String className = entries.nextElement();
-                        if (!SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace(className)) {
-                            continue;
-                        }
-                        candidates++;
-
-                        Class<?> type = null;
-                        discoveryGuard.set(Boolean.TRUE);
-                        try {
-                            type = Class.forName(className, false, loader);
-                            loaded++;
-                        } catch (Throwable ignored) {
-                        } finally {
-                            discoveryGuard.remove();
-                        }
-                        if (type == null) continue;
-
-                        installed += inspectNetworkType(type);
-                    }
-                } catch (Throwable error) {
-                    info("Spotify DEX scan path failed: "
-                            + error.getClass().getSimpleName());
-                } finally {
-                    if (dex != null) {
-                        try {
-                            dex.close();
-                        } catch (Throwable ignored) {
+                for (String apkPath : paths) {
+                    if (apkPath == null || apkPath.isBlank()) continue;
+                    DexFile dex = null;
+                    try {
+                        dex = new DexFile(apkPath);
+                        stats.dexCount++;
+                        scanDexEntries(dex, loader, seenClasses, stats);
+                    } catch (Throwable error) {
+                        info("Spotify DEX scan path failed: "
+                                + error.getClass().getSimpleName());
+                    } finally {
+                        if (dex != null) {
+                            try {
+                                dex.close();
+                            } catch (Throwable ignored) {
+                            }
                         }
                     }
                 }
+            } else if (liveDexFiles.isEmpty()) {
+                info("Spotify DEX structural scan fallback unavailable: application missing");
             }
         } catch (Throwable error) {
             info("Spotify DEX structural scan failed: "
                     + error.getClass().getSimpleName() + ": " + error.getMessage());
         } finally {
-            info("Spotify DEX structural scan finished dex=" + dexCount
-                    + " candidates=" + candidates
-                    + " loaded=" + loaded
-                    + " hooks=" + installed
+            info("Spotify DEX structural scan finished phase=" + phase
+                    + " dex=" + stats.dexCount
+                    + " classes=" + seenClasses.size()
+                    + " candidates=" + stats.candidates
+                    + " loaded=" + stats.loaded
+                    + " hooks=" + stats.installed
                     + " containers=" + hookedContainerClasses.size()
                     + " writers=" + hookedHeaderMethods.size()
                     + " cronetFactories=" + hookedCronetFactoryMethods.size()
                     + " ms=" + (System.currentTimeMillis() - started));
             retireDiscoveryWatcherIfStable();
         }
+    }
+
+    private void scanDexEntries(
+            DexFile dex,
+            ClassLoader loader,
+            Set<String> seenClasses,
+            ScanStats stats) {
+        if (dex == null) return;
+
+        Enumeration<String> entries = dex.entries();
+        while (entries.hasMoreElements()) {
+            String className = entries.nextElement();
+            if (!seenClasses.add(className)
+                    || !SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace(className)) {
+                continue;
+            }
+            stats.candidates++;
+
+            Class<?> type = null;
+            discoveryGuard.set(Boolean.TRUE);
+            try {
+                type = Class.forName(className, false, loader);
+                stats.loaded++;
+            } catch (Throwable ignored) {
+            } finally {
+                discoveryGuard.remove();
+            }
+            if (type == null) continue;
+
+            stats.installed += inspectNetworkType(type);
+        }
+    }
+
+    private Set<DexFile> collectClassLoaderDexFiles(ClassLoader loader) {
+        Set<DexFile> out = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        if (loader == null) return out;
+
+        try {
+            Object pathList = null;
+            for (Class<?> type = loader.getClass(); type != null && pathList == null;
+                    type = type.getSuperclass()) {
+                for (Field field : type.getDeclaredFields()) {
+                    if (!"dalvik.system.DexPathList".equals(field.getType().getName())) continue;
+                    field.setAccessible(true);
+                    pathList = field.get(loader);
+                    if (pathList != null) break;
+                }
+            }
+            if (pathList == null) return out;
+
+            for (Field field : pathList.getClass().getDeclaredFields()) {
+                Class<?> fieldType = field.getType();
+                if (!fieldType.isArray()) continue;
+                Class<?> component = fieldType.getComponentType();
+                if (component == null
+                        || !component.getName().startsWith("dalvik.system.DexPathList$")) {
+                    continue;
+                }
+
+                field.setAccessible(true);
+                Object elements = field.get(pathList);
+                if (elements == null) continue;
+
+                int length = Array.getLength(elements);
+                for (int i = 0; i < length; i++) {
+                    Object element = Array.get(elements, i);
+                    if (element == null) continue;
+                    for (Field elementField : element.getClass().getDeclaredFields()) {
+                        if (!DexFile.class.isAssignableFrom(elementField.getType())) continue;
+                        elementField.setAccessible(true);
+                        Object value = elementField.get(element);
+                        if (value instanceof DexFile) out.add((DexFile) value);
+                    }
+                }
+            }
+        } catch (Throwable error) {
+            info("live ClassLoader DEX discovery unavailable: "
+                    + error.getClass().getSimpleName());
+        }
+
+        if (!out.isEmpty()) {
+            info("live ClassLoader DEX files=" + out.size());
+        }
+        return out;
+    }
+
+    private static final class ScanStats {
+        int dexCount;
+        int candidates;
+        int loaded;
+        int installed;
     }
 
     private static Application currentApplication() {
