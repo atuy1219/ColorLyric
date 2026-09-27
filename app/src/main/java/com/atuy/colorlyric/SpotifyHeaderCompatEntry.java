@@ -51,7 +51,13 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             detach();
             return;
         }
-        info("Spotify update-resilient network discovery loaded; API=" + getApiVersion());
+
+        // Start structural discovery as early as possible. By onPackageLoaded,
+        // Spotify may already have loaded its shaded/obfuscated networking
+        // implementation classes, which would make a loadClass watcher miss them.
+        installClassLoadWatcher();
+        info("Spotify update-resilient network discovery loaded; API=" + getApiVersion()
+                + " earlyWatcher=" + watcherInstalled);
     }
 
     @Override
