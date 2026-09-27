@@ -50,18 +50,17 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     private volatile boolean packageReadyInstalled;
     private volatile boolean watcherInstalled;
     private volatile boolean cronetFactoryHooked;
-    private final Set<ClassLoader> scannedDexLoaders = ConcurrentHashMap.newKeySet();
+    private final Set<String> startedDexScans = ConcurrentHashMap.newKeySet();
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
-        if (!SPOTIFY.equals(param.getProcessName())) {
-            detach();
-            return;
-        }
+        String process = param.getProcessName();
+        info("Spotify compatibility callback process=" + process);
+        if (!SPOTIFY.equals(process)) return;
 
-        // Start structural discovery as early as possible. By onPackageLoaded,
-        // Spotify may already have loaded its shaded/obfuscated networking
-        // implementation classes, which would make a loadClass watcher miss them.
+        // Start structural discovery as early as possible. Do not detach on a
+        // process-name mismatch: Vector may report package lifecycle callbacks
+        // after module load, and those callbacks are the authoritative scope gate.
         installClassLoadWatcher();
         info("Spotify update-resilient network discovery loaded; API=" + getApiVersion()
                 + " earlyWatcher=" + watcherInstalled);
@@ -362,7 +361,9 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     }
 
     private void startDexStructureScan(ClassLoader loader, String phase) {
-        if (loader == null || !scannedDexLoaders.add(loader)) return;
+        if (loader == null) return;
+        String scanKey = phase + "@" + System.identityHashCode(loader);
+        if (!startedDexScans.add(scanKey)) return;
 
         Thread thread = new Thread(() -> scanSpotifyDex(loader, phase),
                 "ColorLyric-SpotifyDexDiscovery");
