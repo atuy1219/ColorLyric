@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 package com.atuy.colorlyric;
 
+import android.app.Application;
+import android.content.Context;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -74,27 +76,79 @@ public final class SpotifyHookEntry extends XposedModule {
     private volatile long committedGeneration = -1L;
     private volatile boolean missingHeadersLogged;
     private volatile boolean hooksInstalled;
+    private volatile boolean attachFallbackInstalled;
     private volatile boolean headerContainerHooked;
     private volatile boolean headerWatcherInstalled;
 
+    public SpotifyHookEntry() {
+        forceLog("SpotifyHookEntry constructed");
+    }
+
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
-        if (!SPOTIFY.equals(param.getProcessName())) {
-            detach();
-            return;
+        String process = param.getProcessName();
+        forceLog("SpotifyHookEntry onModuleLoaded process=" + process);
+        installApplicationAttachFallback();
+        if (SPOTIFY.equals(process)) {
+            info("loaded in Spotify process; API=" + getApiVersion());
         }
-        info("loaded in Spotify main process; API=" + getApiVersion());
+    }
+
+    @Override
+    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
+        if (!SPOTIFY.equals(param.getPackageName())) return;
+        attemptInstall("package-loaded", param.getDefaultClassLoader());
     }
 
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        if (!SPOTIFY.equals(param.getPackageName()) || hooksInstalled) return;
-        synchronized (this) {
-            if (hooksInstalled) return;
-            hooksInstalled = true;
+        if (!SPOTIFY.equals(param.getPackageName())) return;
+        attemptInstall("package-ready", param.getClassLoader());
+    }
+
+    private synchronized void installApplicationAttachFallback() {
+        if (attachFallbackInstalled) return;
+        try {
+            Method attach = Application.class.getDeclaredMethod("attach", Context.class);
+            attach.setAccessible(true);
+            hook(attach)
+                    .setId("colorlyric-spotify-application-attach")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        Object arg = chain.getArg(0);
+                        if (arg instanceof Context) {
+                            Context context = (Context) arg;
+                            if (SPOTIFY.equals(context.getPackageName())) {
+                                attemptInstall("application-attach", context.getClassLoader());
+                            }
+                        }
+                        return result;
+                    });
+            attachFallbackInstalled = true;
+            info("Spotify bootstrap Application.attach hook installed");
+        } catch (Throwable error) {
+            forceLog("Spotify bootstrap Application.attach unavailable: "
+                    + error.getClass().getSimpleName());
+        }
+    }
+
+    private synchronized void attemptInstall(String phase, ClassLoader classLoader) {
+        if (hooksInstalled) {
+            info("Spotify hook bootstrap phase=" + phase + " alreadyInstalled=true");
+            return;
+        }
+        hooksInstalled = true;
+        try {
             installMediaSessionHooks();
-            installSpotifyHeaderHooks(param.getClassLoader());
-            info("Spotify hooks installed");
+            installSpotifyHeaderHooks(classLoader);
+            info("Spotify hooks installed phase=" + phase
+                    + " loader=" + (classLoader == null ? "null"
+                    : classLoader.getClass().getName()));
+        } catch (Throwable error) {
+            hooksInstalled = false;
+            forceLog("Spotify hook bootstrap failed phase=" + phase + ": "
+                    + error.getClass().getSimpleName() + ": " + error.getMessage());
         }
     }
 
@@ -703,6 +757,17 @@ public final class SpotifyHookEntry extends XposedModule {
     private void info(String message) {
         Log.i(TAG, message);
         log(Log.INFO, TAG, message);
+    }
+
+    private static void forceLog(String message) {
+        try {
+            Log.e(TAG, message);
+        } catch (Throwable ignored) {
+        }
+        try {
+            System.err.println(TAG + ": " + message);
+        } catch (Throwable ignored) {
+        }
     }
 
     private static final class Observation {
