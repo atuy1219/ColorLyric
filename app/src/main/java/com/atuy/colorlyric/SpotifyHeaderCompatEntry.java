@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 package com.atuy.colorlyric;
 
+import android.app.Application;
+import android.content.pm.ApplicationInfo;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.util.Log;
@@ -11,9 +13,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+
+import dalvik.system.DexFile;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -44,6 +49,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     private volatile boolean packageReadyInstalled;
     private volatile boolean watcherInstalled;
     private volatile boolean cronetFactoryHooked;
+    private volatile boolean dexScanStarted;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -83,6 +89,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             ClassLoader loader = param.getClassLoader();
             int stable = inspectStableNetworkAnchors(loader);
             installClassLoadWatcher();
+            startDexStructureScan(loader);
             retireDiscoveryWatcherIfStable();
 
             info("Spotify network compatibility ready stableHooks=" + stable
@@ -293,50 +300,156 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             if (watcherInstalled) return;
             watcherInstalled = true;
 
-            for (Method method : ClassLoader.class.getDeclaredMethods()) {
-                if (!"loadClass".equals(method.getName())
-                        || method.getParameterCount() < 1
-                        || method.getParameterTypes()[0] != String.class) {
-                    continue;
-                }
-                try {
-                    method.setAccessible(true);
-                    XposedInterface.HookHandle handle = hook(method)
-                            .setId("colorlyric-compat-network-discovery")
-                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                            .intercept(chain -> {
-                                Object result = chain.proceed();
-                                if (!(result instanceof Class<?>)) return result;
-                                if (Boolean.TRUE.equals(discoveryGuard.get())) return result;
-
-                                Class<?> type = (Class<?>) result;
-                                if (!SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace(
-                                        type.getName())) {
-                                    return result;
-                                }
-
-                                discoveryGuard.set(Boolean.TRUE);
-                                try {
-                                    inspectNetworkType(type);
-                                    retireDiscoveryWatcherIfStable();
-                                } finally {
-                                    discoveryGuard.remove();
-                                }
-                                return result;
-                            });
-                    watcherHandles.add(handle);
-                } catch (Throwable error) {
-                    info("compat class watcher failed: "
-                            + error.getClass().getSimpleName());
-                }
+            installClassResolverWatcher(ClassLoader.class, "loadClass");
+            try {
+                Class<?> baseDex = Class.forName("dalvik.system.BaseDexClassLoader");
+                installClassResolverWatcher(baseDex, "findClass");
+            } catch (Throwable error) {
+                info("BaseDexClassLoader watcher unavailable: "
+                        + error.getClass().getSimpleName());
             }
 
             if (watcherHandles.isEmpty()) {
                 watcherInstalled = false;
                 info("compat structural class watcher unavailable");
             } else {
-                info("compat structural class watcher installed");
+                info("compat structural class watcher installed handles="
+                        + watcherHandles.size());
             }
+        }
+    }
+
+    private void installClassResolverWatcher(Class<?> owner, String methodName) {
+        for (Method method : owner.getDeclaredMethods()) {
+            if (!methodName.equals(method.getName())
+                    || method.getParameterCount() < 1
+                    || method.getParameterTypes()[0] != String.class
+                    || method.getReturnType() != Class.class) {
+                continue;
+            }
+            try {
+                method.setAccessible(true);
+                XposedInterface.HookHandle handle = hook(method)
+                        .setId("colorlyric-compat-network-discovery-" + methodName)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            Object result = chain.proceed();
+                            if (result instanceof Class<?>) inspectResolvedType((Class<?>) result);
+                            return result;
+                        });
+                watcherHandles.add(handle);
+            } catch (Throwable error) {
+                info("compat " + owner.getSimpleName() + "." + methodName
+                        + " watcher failed: " + error.getClass().getSimpleName());
+            }
+        }
+    }
+
+    private void inspectResolvedType(Class<?> type) {
+        if (type == null || Boolean.TRUE.equals(discoveryGuard.get())) return;
+        if (!SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace(type.getName())) return;
+
+        discoveryGuard.set(Boolean.TRUE);
+        try {
+            inspectNetworkType(type);
+            retireDiscoveryWatcherIfStable();
+        } finally {
+            discoveryGuard.remove();
+        }
+    }
+
+    private void startDexStructureScan(ClassLoader loader) {
+        if (dexScanStarted) return;
+        synchronized (this) {
+            if (dexScanStarted) return;
+            dexScanStarted = true;
+        }
+
+        Thread thread = new Thread(() -> scanSpotifyDex(loader),
+                "ColorLyric-SpotifyDexDiscovery");
+        thread.setDaemon(true);
+        thread.setPriority(Thread.MIN_PRIORITY);
+        thread.start();
+    }
+
+    private void scanSpotifyDex(ClassLoader loader) {
+        long started = System.currentTimeMillis();
+        int dexCount = 0;
+        int candidates = 0;
+        int loaded = 0;
+        int installed = 0;
+
+        try {
+            Application application = currentApplication();
+            if (application == null) {
+                info("Spotify DEX structural scan skipped: application unavailable");
+                return;
+            }
+
+            ApplicationInfo appInfo = application.getApplicationInfo();
+            String[] splitDirs = appInfo.splitSourceDirs;
+            int totalPaths = 1 + (splitDirs == null ? 0 : splitDirs.length);
+            String[] paths = new String[totalPaths];
+            paths[0] = appInfo.sourceDir;
+            if (splitDirs != null) {
+                System.arraycopy(splitDirs, 0, paths, 1, splitDirs.length);
+            }
+
+            for (String apkPath : paths) {
+                if (apkPath == null || apkPath.isBlank()) continue;
+                try (DexFile dex = new DexFile(apkPath)) {
+                    dexCount++;
+                    Enumeration<String> entries = dex.entries();
+                    while (entries.hasMoreElements()) {
+                        String className = entries.nextElement();
+                        if (!SpotifyHeaderDiscoveryPolicy.isSpotifyNetworkNamespace(className)) {
+                            continue;
+                        }
+                        candidates++;
+
+                        Class<?> type = null;
+                        discoveryGuard.set(Boolean.TRUE);
+                        try {
+                            type = Class.forName(className, false, loader);
+                            loaded++;
+                        } catch (Throwable ignored) {
+                        } finally {
+                            discoveryGuard.remove();
+                        }
+                        if (type == null) continue;
+
+                        installed += inspectNetworkType(type);
+                    }
+                } catch (Throwable error) {
+                    info("Spotify DEX scan path failed: "
+                            + error.getClass().getSimpleName());
+                }
+            }
+        } catch (Throwable error) {
+            info("Spotify DEX structural scan failed: "
+                    + error.getClass().getSimpleName() + ": " + error.getMessage());
+        } finally {
+            info("Spotify DEX structural scan finished dex=" + dexCount
+                    + " candidates=" + candidates
+                    + " loaded=" + loaded
+                    + " hooks=" + installed
+                    + " containers=" + hookedContainerClasses.size()
+                    + " writers=" + hookedHeaderMethods.size()
+                    + " cronetFactories=" + hookedCronetFactoryMethods.size()
+                    + " ms=" + (System.currentTimeMillis() - started));
+            retireDiscoveryWatcherIfStable();
+        }
+    }
+
+    private static Application currentApplication() {
+        try {
+            Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            Method method = activityThread.getDeclaredMethod("currentApplication");
+            method.setAccessible(true);
+            Object value = method.invoke(null);
+            return value instanceof Application ? (Application) value : null;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
