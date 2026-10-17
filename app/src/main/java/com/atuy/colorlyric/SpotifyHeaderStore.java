@@ -5,9 +5,10 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 final class SpotifyHeaderStore {
-    private static final String[] REQUIRED = {
+    private static final String[] TRACKED = {
             "authorization",
             "client-token",
             "user-agent",
@@ -15,16 +16,25 @@ final class SpotifyHeaderStore {
     };
 
     private static final ConcurrentHashMap<String, String> HEADERS = new ConcurrentHashMap<>();
+    private static final AtomicLong REVISION = new AtomicLong();
 
     private SpotifyHeaderStore() {}
 
     static boolean ingest(String name, String value) {
         if (name == null || value == null || value.isBlank()) return false;
-        String key = name.toLowerCase(Locale.ROOT);
-        if (!isRequiredKey(key)) return false;
-        boolean wasReady = isReady();
-        HEADERS.put(key, value);
-        return !wasReady && isReady();
+        String key = name.trim().toLowerCase(Locale.ROOT);
+        if (!isTrackedKey(key)) return false;
+        String safeValue = value.trim();
+        // Spotify's Android client may no longer set client-token, user-agent
+        // or x-client-id explicitly on every request. A valid Bearer token is
+        // sufficient to attempt the official lyrics API.
+        if ("authorization".equals(key) && !isBearer(safeValue)) return false;
+        String previous = HEADERS.put(key, safeValue);
+        if (safeValue.equals(previous)) return false;
+        REVISION.incrementAndGet();
+        // Credentials may arrive in stages. Notify the fetcher about optional
+        // headers and token refreshes even after initial readiness.
+        return isReady();
     }
 
     static boolean ingestPairs(Object raw) {
@@ -38,11 +48,17 @@ final class SpotifyHeaderStore {
     }
 
     static boolean isReady() {
-        for (String key : REQUIRED) {
-            String value = HEADERS.get(key);
-            if (value == null || value.isBlank()) return false;
-        }
-        return true;
+        return isBearer(HEADERS.get("authorization"));
+    }
+
+    static long revision() {
+        return REVISION.get();
+    }
+
+    private static boolean isBearer(String value) {
+        return value != null && value.length() > 7
+                && value.regionMatches(true, 0, "Bearer ", 0, 7)
+                && !value.substring(7).isBlank();
     }
 
     static Map<String, String> snapshot() {
@@ -51,7 +67,7 @@ final class SpotifyHeaderStore {
 
     static String capturedKeys() {
         StringBuilder out = new StringBuilder();
-        for (String key : REQUIRED) {
+        for (String key : TRACKED) {
             if (!HEADERS.containsKey(key)) continue;
             if (out.length() > 0) out.append(',');
             out.append(key);
@@ -60,14 +76,20 @@ final class SpotifyHeaderStore {
     }
 
     static void invalidateAuthorization() {
-        HEADERS.remove("authorization");
-        HEADERS.remove("client-token");
+        boolean changed = HEADERS.remove("authorization") != null;
+        changed |= HEADERS.remove("client-token") != null;
+        if (changed) REVISION.incrementAndGet();
     }
 
-    private static boolean isRequiredKey(String key) {
-        for (String required : REQUIRED) {
-            if (required.equals(key)) return true;
+    private static boolean isTrackedKey(String key) {
+        for (String tracked : TRACKED) {
+            if (tracked.equals(key)) return true;
         }
         return false;
+    }
+
+    static void clearForTest() {
+        HEADERS.clear();
+        REVISION.set(0L);
     }
 }
