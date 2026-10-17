@@ -37,6 +37,29 @@ public final class SpotifyHeaderDiscoveryPolicyTest {
     }
 
     @Test
+    public void recognizesObfuscatedStringPairHeaderSetters() throws Exception {
+        Method valid = ObfuscatedHeaderBuilder.class.getDeclaredMethod(
+                "b", String.class, String.class);
+        Method otherValid = ObfuscatedHeaderBuilder.class.getDeclaredMethod(
+                "d", String.class, String.class);
+        Method wrongType = ObfuscatedHeaderBuilder.class.getDeclaredMethod(
+                "g", String.class, int.class);
+        Method wrongReturn = ObfuscatedHeaderBuilder.class.getDeclaredMethod(
+                "h", String.class, String.class);
+        Method staticMethod = ObfuscatedHeaderBuilder.class.getDeclaredMethod(
+                "i", String.class, String.class);
+        Method abstractMethod = AbstractBuilder.class.getDeclaredMethod(
+                "addHeader", String.class, String.class);
+
+        assertTrue(SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(valid));
+        assertTrue(SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(otherValid));
+        assertFalse(SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(wrongType));
+        assertFalse(SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(wrongReturn));
+        assertFalse(SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(staticMethod));
+        assertFalse(SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(abstractMethod));
+    }
+
+    @Test
     public void recognizesCronetRequestBuilderFactoryShape() throws Exception {
         Method valid = FakeCronetEngine.class.getDeclaredMethod(
                 "newUrlRequestBuilder", String.class, Object.class, Object.class);
@@ -110,6 +133,14 @@ public final class SpotifyHeaderDiscoveryPolicyTest {
         public Iterator<String> iterator() {
             return Arrays.asList(values).iterator();
         }
+    }
+
+    private static class ObfuscatedHeaderBuilder {
+        void b(String name, String value) {}
+        void d(String name, String value) {}
+        void g(String name, int value) {}
+        String h(String name, String value) { return name; }
+        static void i(String name, String value) {}
     }
 
     private static class FakeBuilder {
