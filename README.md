@@ -69,6 +69,13 @@ present, but are not mandatory:
 - `user-agent`
 - `x-client-id`
 
+Spotify 9.1.92.3058 also uses obfuscated request-header setters
+(`p.k050` and `p.zd`) that bypass both the stable Cronet builder
+and the previous immutable-header discovery. ColorLyric now hooks
+their concrete two-string setter methods at package load. The hook
+only captures the four recognized header names, never their log values.
+These class names are version-specific fallbacks, not permanent APIs.
+
 New or refreshed headers trigger a retry with a distinct credential revision,
 so earlier 401/403 misses do not block recovery. The primary v3/v2 Android
 endpoints are retained, followed by a Bearer-only `spclient.wg.spotify.com`
