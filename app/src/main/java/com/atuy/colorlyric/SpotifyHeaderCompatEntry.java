@@ -150,6 +150,12 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         installed += inspectKnownClass(classLoader, "org.chromium.net.ExperimentalCronetEngine");
         installed += inspectKnownClass(classLoader, "org.chromium.net.UrlRequest$Builder");
         installed += inspectKnownClass(classLoader, "okhttp3.Headers");
+        // In Spotify 9.1.92.3058, request Authorization and X-Client-Id are
+        // written through p.k050 and p.zd rather than the standard
+        // Cronet UrlRequest.Builder#addHeader method. The normal structural
+        // discovery cannot find these intentionally obfuscated writers.
+        installed += inspectSpotifyAndroidHeaderWriter(classLoader, "p.k050");
+        installed += inspectSpotifyAndroidHeaderWriter(classLoader, "p.zd");
         return installed;
     }
 
@@ -159,6 +165,48 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         } catch (Throwable ignored) {
             return 0;
         }
+    }
+
+    private int inspectSpotifyAndroidHeaderWriter(ClassLoader classLoader, String name) {
+        if (classLoader == null) return 0;
+        Class<?> type;
+        try {
+            type = Class.forName(name, false, classLoader);
+        } catch (Throwable error) {
+            info("Spotify APK header writer unavailable " + name + ": "
+                    + error.getClass().getSimpleName());
+            return 0;
+        }
+
+        int installed = 0;
+        for (Method method : type.getDeclaredMethods()) {
+            if (!SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(method)) continue;
+            String key = type.getName() + "#" + method.toGenericString();
+            if (!hookedHeaderMethods.add(key)) continue;
+            try {
+                method.setAccessible(true);
+                hook(method)
+                        .setId("colorlyric-spotify-android-header-writer")
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            Object rawName = chain.getArg(0);
+                            Object rawValue = chain.getArg(1);
+                            if (rawName instanceof String && rawValue instanceof String
+                                    && SpotifyHeaderStore.ingest(
+                                            (String) rawName, (String) rawValue)) {
+                                onHeadersReady("spotify-writer:" + type.getName());
+                            }
+                            return chain.proceed();
+                        });
+                installed++;
+            } catch (Throwable error) {
+                hookedHeaderMethods.remove(key);
+                info("Spotify APK header writer hook failed " + type.getName()
+                        + ": " + error.getClass().getSimpleName());
+            }
+        }
+        info("Spotify APK header writer target=" + name + " hooks=" + installed);
+        return installed;
     }
 
     private int inspectNetworkType(Class<?> type) {
