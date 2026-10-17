@@ -106,7 +106,6 @@ final class SpotifyColorLyricsClient {
     private static boolean shouldTryAnotherEndpoint(Result result) {
         if (result == null || result.isSuccess()) return false;
         return !"cancelled".equals(result.outcome)
-                && !"http-401".equals(result.outcome)
                 && !"http-429".equals(result.outcome);
     }
 
@@ -125,9 +124,19 @@ final class SpotifyColorLyricsClient {
             connection.setReadTimeout(READ_TIMEOUT_MS);
             connection.setRequestMethod("GET");
             connection.setRequestProperty("accept", "application/json");
-            connection.setRequestProperty("app-platform", "WebPlayer");
+            boolean webSpclient = url.startsWith("https://spclient.wg.spotify.com/");
+            if (!webSpclient) {
+                // Reuse the Android client's auth context rather than mixing
+                // an Android client-token with a WebPlayer platform label.
+                connection.setRequestProperty("app-platform", "Android");
+            }
             for (Map.Entry<String, String> entry : headers.entrySet()) {
-                if (entry.getKey() == null || entry.getValue() == null || entry.getValue().isBlank()) continue;
+                if (entry.getKey() == null || entry.getValue() == null || entry.getValue().isBlank()) {
+                    continue;
+                }
+                // This fallback uses the Bearer token alone: forwarding the
+                // mobile client's optional headers may cause a 403 response.
+                if (webSpclient && !"authorization".equalsIgnoreCase(entry.getKey())) continue;
                 connection.setRequestProperty(entry.getKey(), entry.getValue());
             }
 
