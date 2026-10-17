@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 package com.atuy.colorlyric;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -57,7 +58,17 @@ final class SpotifyDexHeaderWriterDiscovery {
                 if (!name.matches("classes(\\d+)?\\.dex") || entry.isDirectory()
                         || entry.getSize() > MAX_DEX_SIZE) continue;
                 try (InputStream stream = apk.getInputStream(entry)) {
-                    byte[] bytes = stream.readNBytes(MAX_DEX_SIZE + 1);
+                    // InputStream.readNBytes(int) requires Android 13 (API 33).
+                    // Use the API 31-compatible InputStream.read(byte[]) instead.
+                    ByteArrayOutputStream buffer = new ByteArrayOutputStream(
+                            Math.max(1024, (int) Math.min(entry.getSize(), 64 * 1024)));
+                    byte[] chunk = new byte[8192];
+                    int count;
+                    while ((count = stream.read(chunk)) != -1) {
+                        if (buffer.size() + count > MAX_DEX_SIZE) break;
+                        buffer.write(chunk, 0, count);
+                    }
+                    byte[] bytes = buffer.toByteArray();
                     if (bytes.length > MAX_DEX_SIZE) continue;
                     out.addAll(scanDex(bytes));
                 } catch (RuntimeException ignored) {
