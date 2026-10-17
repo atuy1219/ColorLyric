@@ -71,10 +71,9 @@ final class SpotifyHeaderDiscoveryPolicy {
 
 
     /**
-     * Spotify 9.1.92.x builds request headers through obfuscated setters
-     * such as p.k050#b(String, String) and p.zd#d(String, String).
-     * Match these method shapes only on explicitly selected classes:
-     * matching arbitrary classes would create far too many hooks.
+     * Checks a DEX-discovered header writer before installing a Hook. Never
+     * install this on all (String, String) methods: only the DEX call-site
+     * analyzer can select candidate owners.
      */
     static boolean isStringPairHeaderWriter(Method method) {
         if (method == null
