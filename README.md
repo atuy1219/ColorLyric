@@ -69,12 +69,14 @@ present, but are not mandatory:
 - `user-agent`
 - `x-client-id`
 
-Spotify 9.1.92.3058 also uses obfuscated request-header setters
-(`p.k050` and `p.zd`) that bypass both the stable Cronet builder
-and the previous immutable-header discovery. ColorLyric now hooks
-their concrete two-string setter methods at package load. The hook
-only captures the four recognized header names, never their log values.
-These class names are version-specific fallbacks, not permanent APIs.
+ColorLyric no longer hard-codes obfuscated request-writer classes. An asynchronous,
+read-only DEX scan checks the installed Spotify APK (including secondary DEX files)
+for the stable `Authorization` HTTP header constant and follows nearby calls to
+concrete `(String, String) -> void` writer methods. Only these narrow candidates
+are hooked; other network methods are left unchanged. Spotify 9.1.92.3058
+produces the same two writer candidates previously found by manual analysis.
+The implementation also preserves stable Cronet hooks and structural discovery
+as additional paths. It never logs credential values.
 
 New or refreshed headers trigger a retry with a distinct credential revision,
 so earlier 401/403 misses do not block recovery. The primary v3/v2 Android
@@ -89,11 +91,11 @@ Supported timing:
 - `LINE_SYNCED`
 - `SYLLABLE_SYNCED`
 
-For Spotify update tolerance, ColorLyric no longer relies on Spotify's R8 `p.*` names as its
-primary mechanism. Network discovery starts during `onPackageLoaded`, before `onPackageReady`,
-and watches classes by structure. When a concrete Cronet engine appears, ColorLyric hooks
-`newUrlRequestBuilder(...)`, then hooks the actual builder instance returned at runtime to capture
-the required auth headers. Known obfuscated class names are retained only as startup hints.
+Discovery begins during `onPackageLoaded`, before `onPackageReady`, without depending
+on the current R8 class names. The DEX call-site scanner runs off the Spotify main thread.
+Separately, when a concrete Cronet engine appears, ColorLyric hooks
+`newUrlRequestBuilder(...)` and inspects the returned builder for standard header setters.
+Malformed or unsupported DEX files are skipped without affecting normal playback.
 
 ColorLyric also observes Spotify's own Color Lyrics request URL. A Spotify HTTPS
 `/color-lyrics/.../track/` URL is converted into a track-ID template while preserving the host,
@@ -151,7 +153,7 @@ Expected Spotify lines include:
 loaded in Spotify main process; API=102
 Spotify update-resilient network discovery loaded; API=102
 runtime Cronet builder=... writers=1
-Spotify auth headers ready keys=authorization,client-token,user-agent,x-client-id
+Spotify auth headers recovered via dex-writer:... keys=authorization,...
 learned Spotify Color Lyrics endpoint revision=...
 Spotify Color Lyrics outcome=ok syncType=LINE_SYNCED ...
 official Spotify lyricInfo committed once: ........
