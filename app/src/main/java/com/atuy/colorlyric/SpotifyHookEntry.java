@@ -577,14 +577,19 @@ public final class SpotifyHookEntry extends XposedModule {
         }
 
         long endpointRevision = SpotifyEndpointStore.revision();
-        String endpointKey = trackKey + "|endpoint=" + endpointRevision;
+        long headerRevision = SpotifyHeaderStore.revision();
+        String endpointKey = trackKey + "|endpoint=" + endpointRevision
+                + "|headers=" + headerRevision;
         long now = System.currentTimeMillis();
         Long negativeUntil = negativeCache.get(endpointKey);
         if (SpotifyFetchPolicy.isNegativeCached(negativeUntil, now)) return;
         if (negativeUntil != null) negativeCache.remove(endpointKey);
 
         String requestKey = SpotifyFetchPolicy.requestKey(trackKey, currentGeneration)
-                + "|endpoint=" + endpointRevision;
+                + "|endpoint=" + endpointRevision + "|headers=" + headerRevision;
+        // Reissued credentials or a late client-token must not be suppressed
+        // by an earlier 401/403 cached under the same song.
+        cancelStaleFetches(requestKey);
         if (!inFlight.add(requestKey)) return;
 
         SpotifyColorLyricsClient.FetchCall call = new SpotifyColorLyricsClient.FetchCall();
