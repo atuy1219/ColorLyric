@@ -60,6 +60,10 @@ final class SpotifyEndpointStore {
                 + "?vocalRemoval=false&clientLanguage=" + safeLanguage + "&preview=false");
         urls.add("https://guc3-spclient.spotify.com/color-lyrics/v2/track/" + trackId
                 + "?vocalRemoval=false&clientLanguage=" + safeLanguage + "&preview=false");
+        // A Bearer-only endpoint is useful when the mobile app's client-token
+        // is not observable or a regional spclient host rejects the request.
+        urls.add("https://spclient.wg.spotify.com/color-lyrics/v2/track/" + trackId
+                + "?format=json&vocalRemoval=false&market=from_token");
         return new ArrayList<>(urls);
     }
 
