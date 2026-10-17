@@ -51,6 +51,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
     private volatile boolean watcherInstalled;
     private volatile boolean cronetFactoryHooked;
     private final Set<String> startedDexScans = ConcurrentHashMap.newKeySet();
+    private final Set<String> startedHeaderApkScans = ConcurrentHashMap.newKeySet();
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -74,6 +75,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             installClassLoadWatcher();
             ClassLoader loader = param.getDefaultClassLoader();
             int stable = inspectStableNetworkAnchors(loader);
+            startApkHeaderWriterDiscovery(param.getApplicationInfo(), loader);
             startDexStructureScan(loader, "package-loaded");
             info("early Spotify network discovery installed stableHooks=" + stable
                     + " watcher=" + watcherInstalled);
@@ -91,6 +93,7 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
             ClassLoader loader = param.getClassLoader();
             int stable = inspectStableNetworkAnchors(loader);
             installClassLoadWatcher();
+            startApkHeaderWriterDiscovery(param.getApplicationInfo(), loader);
             startDexStructureScan(loader, "package-ready");
             retireDiscoveryWatcherIfStable();
 
@@ -150,12 +153,6 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         installed += inspectKnownClass(classLoader, "org.chromium.net.ExperimentalCronetEngine");
         installed += inspectKnownClass(classLoader, "org.chromium.net.UrlRequest$Builder");
         installed += inspectKnownClass(classLoader, "okhttp3.Headers");
-        // In Spotify 9.1.92.3058, request Authorization and X-Client-Id are
-        // written through p.k050 and p.zd rather than the standard
-        // Cronet UrlRequest.Builder#addHeader method. The normal structural
-        // discovery cannot find these intentionally obfuscated writers.
-        installed += inspectSpotifyAndroidHeaderWriter(classLoader, "p.k050");
-        installed += inspectSpotifyAndroidHeaderWriter(classLoader, "p.zd");
         return installed;
     }
 
@@ -167,46 +164,76 @@ public final class SpotifyHeaderCompatEntry extends XposedModule {
         }
     }
 
-    private int inspectSpotifyAndroidHeaderWriter(ClassLoader classLoader, String name) {
-        if (classLoader == null) return 0;
-        Class<?> type;
-        try {
-            type = Class.forName(name, false, classLoader);
-        } catch (Throwable error) {
-            info("Spotify APK header writer unavailable " + name + ": "
-                    + error.getClass().getSimpleName());
-            return 0;
-        }
+    private void startApkHeaderWriterDiscovery(ApplicationInfo appInfo, ClassLoader loader) {
+        if (appInfo == null || appInfo.sourceDir == null || loader == null) return;
+        // Scan once per APK/ClassLoader. Keep this off the Spotify main thread.
+        String key = appInfo.sourceDir + "@" + System.identityHashCode(loader);
+        if (!startedHeaderApkScans.add(key)) return;
+        String baseApk = appInfo.sourceDir;
+        String[] splitApks = appInfo.splitSourceDirs;
+        Thread thread = new Thread(() -> {
+            Set<SpotifyDexHeaderWriterDiscovery.Candidate> found = new HashSet<>();
+            try {
+                found.addAll(SpotifyDexHeaderWriterDiscovery.scanApk(baseApk));
+                if (splitApks != null) {
+                    for (String splitApk : splitApks) {
+                        if (splitApk == null || splitApk.isBlank()) continue;
+                        found.addAll(SpotifyDexHeaderWriterDiscovery.scanApk(splitApk));
+                    }
+                }
+                int hooks = 0;
+                for (SpotifyDexHeaderWriterDiscovery.Candidate target : found) {
+                    hooks += hookDiscoveredHeaderWriter(loader, target);
+                }
+                info("Spotify DEX auth-writer discovery candidates=" + found.size()
+                        + " hooks=" + hooks);
+            } catch (Throwable error) {
+                startedHeaderApkScans.remove(key);
+                info("Spotify DEX auth-writer discovery failed: "
+                        + error.getClass().getSimpleName() + ": " + error.getMessage());
+            }
+        }, "ColorLyric-HeaderDiscovery");
+        thread.setDaemon(true);
+        thread.setPriority(Thread.NORM_PRIORITY - 1);
+        thread.start();
+    }
 
-        int installed = 0;
-        for (Method method : type.getDeclaredMethods()) {
-            if (!SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(method)) continue;
+    private int hookDiscoveredHeaderWriter(
+            ClassLoader loader, SpotifyDexHeaderWriterDiscovery.Candidate target) {
+        try {
+            Class<?> type = Class.forName(target.className, false, loader);
+            Method method = type.getDeclaredMethod(target.methodName,
+                    String.class, String.class);
+            if (!SpotifyHeaderDiscoveryPolicy.isStringPairHeaderWriter(method)) return 0;
             String key = type.getName() + "#" + method.toGenericString();
-            if (!hookedHeaderMethods.add(key)) continue;
+            if (!hookedHeaderMethods.add(key)) return 0;
             try {
                 method.setAccessible(true);
                 hook(method)
-                        .setId("colorlyric-spotify-android-header-writer")
+                        .setId("colorlyric-dex-discovered-header-writer")
                         .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                         .intercept(chain -> {
-                            Object rawName = chain.getArg(0);
-                            Object rawValue = chain.getArg(1);
-                            if (rawName instanceof String && rawValue instanceof String
+                            Object name = chain.getArg(0);
+                            Object value = chain.getArg(1);
+                            if (name instanceof String && value instanceof String
                                     && SpotifyHeaderStore.ingest(
-                                            (String) rawName, (String) rawValue)) {
-                                onHeadersReady("spotify-writer:" + type.getName());
+                                            (String) name, (String) value)) {
+                                onHeadersReady("dex-writer:" + target.className);
                             }
                             return chain.proceed();
                         });
-                installed++;
+                info("Spotify DEX auth-writer hook=" + target.className
+                        + "#" + target.methodName);
+                return 1;
             } catch (Throwable error) {
                 hookedHeaderMethods.remove(key);
-                info("Spotify APK header writer hook failed " + type.getName()
-                        + ": " + error.getClass().getSimpleName());
+                throw error;
             }
+        } catch (Throwable error) {
+            info("Spotify DEX auth-writer hook unavailable " + target.className
+                    + ": " + error.getClass().getSimpleName());
+            return 0;
         }
-        info("Spotify APK header writer target=" + name + " hooks=" + installed);
-        return installed;
     }
 
     private int inspectNetworkType(Class<?> type) {
