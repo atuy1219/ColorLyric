@@ -25,7 +25,10 @@ public class SpotifyEndpointStoreTest {
         assertTrue(urls.get(0).startsWith(
                 "https://gew1-spclient.spotify.com/color-lyrics/v9/track/newTrack?"));
         assertTrue(urls.get(0).contains("future=1"));
-        assertEquals(3, urls.size());
+        assertEquals(4, urls.size());
+        assertTrue(urls.get(3).startsWith(
+                "https://spclient.wg.spotify.com/color-lyrics/v2/track/newTrack?"));
+        assertTrue(urls.get(3).contains("market=from_token"));
     }
 
     @Test
