@@ -61,14 +61,18 @@ policy method.
 
 ## Spotify lyric source
 
-ColorLyric captures only the headers needed by Spotify's Color Lyrics request path:
+ColorLyric starts lyric requests as soon as it has a valid Spotify `Bearer`
+`authorization` header. The following Spotify Android headers are captured when
+present, but are not mandatory:
 
-- `authorization`
 - `client-token`
 - `user-agent`
 - `x-client-id`
 
-Header values are never written to ColorLyric logs.
+New or refreshed headers trigger a retry with a distinct credential revision,
+so earlier 401/403 misses do not block recovery. The primary v3/v2 Android
+endpoints are retained, followed by a Bearer-only `spclient.wg.spotify.com`
+v2 fallback. Header values are never written to ColorLyric logs.
 
 The current `spotify:track:` ID is requested from Spotify Color Lyrics. This keeps lyric timing aligned
 with Spotify playback instead of a third-party LRC database.
